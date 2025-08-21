@@ -1,5 +1,5 @@
 from flask import Blueprint, jsonify, request
-from database import get_connection
+from database import get_connection, DB_SCHEMA
 from datetime import date, datetime
 
 employees_bp = Blueprint('employees', __name__, url_prefix='/employees')
@@ -39,12 +39,10 @@ def update_employee_count(unit_id, delta):
 
 # ======= API =======
 # GET - Lấy danh sách nhân viên (có thể lọc theo phòng ban cha + phòng con)
-EMPLOYEE_TABLE = "`db qlda`.employees2026_base"  # bảng thật sau khi rename
+EMPLOYEE_TABLE = f"`{DB_SCHEMA}`.employees2026_base"  # bảng thật sau khi rename
+
 @employees_bp.route('/list', methods=['GET'])
 def get_employees_list():
-    from datetime import date, datetime
-    from flask import request, jsonify
-
     org_id = request.args.get('org_id', type=int)
 
     conn = get_connection()
@@ -100,9 +98,9 @@ def get_employees_list():
     cursor.close()
     conn.close()
     return jsonify(rows)
+
 @employees_bp.route('/add', methods=['POST'])
 def add_employee():
-    from flask import request, jsonify
     data = request.json or {}
 
     conn = get_connection()
@@ -148,9 +146,9 @@ def add_employee():
     cursor.close()
     conn.close()
     return jsonify({"message": "Thêm nhân viên thành công"}), 201
+
 @employees_bp.route('/update/<int:id>', methods=['PUT'])
 def update_employee(id):
-    from flask import request, jsonify
     data = request.json or {}
 
     conn = get_connection()
@@ -236,16 +234,14 @@ def update_employee(id):
 # DELETE - Xoá nhân viên
 @employees_bp.route('/delete/<int:id>', methods=['DELETE'])
 def delete_employee(id):
-    from flask import jsonify
-
     conn = get_connection()
     cursor = conn.cursor()
 
     try:
         # Lấy unit & trạng thái từ bảng GỐC
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT organization_unit_id, employment_status
-            FROM `db qlda`.employees2026_base
+            FROM `{DB_SCHEMA}`.employees2026_base
             WHERE id = %s
         """, (id,))
         row = cursor.fetchone()
@@ -262,8 +258,8 @@ def delete_employee(id):
             update_employee_count(org_unit_id, -1)
 
         # Xoá bản ghi ở bảng GỐC
-        cursor.execute("""
-            DELETE FROM `db qlda`.employees2026_base
+        cursor.execute(f"""
+            DELETE FROM `{DB_SCHEMA}`.employees2026_base
             WHERE id = %s
         """, (id,))
 
@@ -281,7 +277,7 @@ def get_employees_by_department(unit_id):
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
 
-    query = """
+    query = f"""
         WITH RECURSIVE descendants AS (
             SELECT id FROM organization_units WHERE id = %s
             UNION ALL
@@ -318,7 +314,7 @@ def get_employees_by_department(unit_id):
                         (COALESCE(p.approved_ey_score, 0) * COALESCE(p.approver_ti_trong, 0)) / 100
                     , 2)), 0
                 )
-                FROM `db qlda`.personalmbo p
+                FROM `{DB_SCHEMA}`.personalmbo p
                 WHERE p.employee_code = e.employee_code
                   AND p.mbo_year = YEAR(CURDATE())
             ) AS job_score,
@@ -330,7 +326,7 @@ def get_employees_by_department(unit_id):
                         (COALESCE(c.approved_ey_score, 0) * COALESCE(c.approver_ti_trong, 0)) / 100
                     , 2)), 0
                 )
-                FROM `db qlda`.competencymbo c
+                FROM `{DB_SCHEMA}`.competencymbo c
                 WHERE c.employee_code = e.employee_code
                   AND c.mbo_year = YEAR(CURDATE())
             ) AS competency_score,
@@ -345,7 +341,7 @@ def get_employees_by_department(unit_id):
                                 (COALESCE(p2.approved_ey_score, 0) * COALESCE(p2.approver_ti_trong, 0)) / 100
                             , 2)), 0
                         )
-                        FROM `db qlda`.personalmbo p2
+                        FROM `{DB_SCHEMA}`.personalmbo p2
                         WHERE p2.employee_code = e.employee_code
                           AND p2.mbo_year = YEAR(CURDATE())
                     )
@@ -356,7 +352,7 @@ def get_employees_by_department(unit_id):
                                 (COALESCE(c2.approved_ey_score, 0) * COALESCE(c2.approver_ti_trong, 0)) / 100
                             , 2)), 0
                         )
-                        FROM `db qlda`.competencymbo c2
+                        FROM `{DB_SCHEMA}`.competencymbo c2
                         WHERE c2.employee_code = e.employee_code
                           AND c2.mbo_year = YEAR(CURDATE())
                     )
@@ -373,9 +369,9 @@ def get_employees_by_department(unit_id):
                 WHEN e.corporation IS NOT NULL AND e.corporation != '' THEN e.corporation
                 ELSE NULL
             END AS department_name
-        FROM `db qlda`.employees2026 e
+        FROM `{DB_SCHEMA}`.employees2026 e
         JOIN descendants d ON e.organization_unit_id = d.id
-        LEFT JOIN `db qlda`.mbo_sessions ms 
+        LEFT JOIN `{DB_SCHEMA}`.mbo_sessions ms 
             ON e.id = ms.employee_id AND ms.mbo_year = YEAR(CURDATE())
     """
 
@@ -387,15 +383,8 @@ def get_employees_by_department(unit_id):
 
     return jsonify(employees)
 
-
-
-
-
 @employees_bp.route("/accessible-units", methods=["GET"])
 def get_accessible_organization_units():
-    from flask import request, jsonify
-    from database import get_connection
-
     org_unit_id = request.headers.get("X-Org-Unit-Id")
     permissions = request.headers.get("X-Permissions", "")
 
@@ -443,7 +432,6 @@ def get_accessible_organization_units():
     finally:
         connection.close()
 
-
 def get_all_sub_unit_ids(start_ids, cursor):
     """
     Đệ quy lấy tất cả organization_unit_id con của các ID được truyền vào
@@ -459,7 +447,6 @@ def get_all_sub_unit_ids(start_ids, cursor):
         all_ids.update(children)
 
     return list(all_ids)
-
 
 @employees_bp.route('/by-subordinates', methods=['POST'])
 def get_employees_for_allocation():
@@ -519,7 +506,7 @@ def get_employees_for_allocation():
             if emp_ids:
                 emp_format = ','.join(['%s'] * len(emp_ids))
                 cursor.execute(
-                    f"SELECT * FROM employees2026 WHERE id IN ({emp_format})",
+                    f"SELECT * FROM `{DB_SCHEMA}`.employees2026 WHERE id IN ({emp_format})",
                     tuple(emp_ids)
                 )
                 result_employees.extend(cursor.fetchall())
@@ -530,15 +517,15 @@ def get_employees_for_allocation():
                 if recursive_emp_ids:
                     emp_format = ','.join(['%s'] * len(recursive_emp_ids))
                     cursor.execute(
-                        f"SELECT * FROM employees2026 WHERE id IN ({emp_format})",
+                        f"SELECT * FROM `{DB_SCHEMA}`.employees2026 WHERE id IN ({emp_format})",
                         tuple(recursive_emp_ids)
                     )
                     result_employees.extend(cursor.fetchall())
                 else:
                     # ✅ Không có quản lý cấp dưới nào → lấy nhân viên trong đơn vị đó
-                    cursor.execute("""
+                    cursor.execute(f"""
                         SELECT *
-                        FROM employees2026
+                        FROM `{DB_SCHEMA}`.employees2026
                         WHERE organization_unit_id = %s AND id != %s
                     """, (managed_id, current_user_id))
                     result_employees.extend(cursor.fetchall())
@@ -559,6 +546,7 @@ def get_employees_for_allocation():
     finally:
         cursor.close()
         conn.close()
+
 @employees_bp.route('/mbo/score-final', methods=['PUT'])
 def update_score_final():
     """
@@ -592,8 +580,8 @@ def update_score_final():
     cursor = conn.cursor()
 
     try:
-        cursor.execute("""
-            UPDATE `db qlda`.mbo_sessions
+        cursor.execute(f"""
+            UPDATE `{DB_SCHEMA}`.mbo_sessions
             SET score_final = %s
             WHERE employee_id = %s AND mbo_year = %s
         """, (score_final, employee_id, mbo_year))
@@ -611,6 +599,3 @@ def update_score_final():
     finally:
         cursor.close()
         conn.close()
-
-
-
