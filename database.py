@@ -2,7 +2,7 @@ import mysql.connector
 import os
 
 # Đặt tên schema ở đây (sau này chỉ cần đổi 1 chỗ)
-DB_SCHEMA = os.getenv("DB_SCHEMA", "db vcc")
+DB_SCHEMA = os.getenv("DB_SCHEMA", "nsh")
 
 def get_connection():
     return mysql.connector.connect(
