@@ -274,6 +274,9 @@ def delete_employee(id):
 
 @employees_bp.route('/by-department/<int:unit_id>', methods=['GET'])
 def get_employees_by_department(unit_id):
+    # Lấy năm từ query ?mbo_year=2025, fallback = năm hiện tại
+    mbo_year = request.args.get('mbo_year', type=int) or date.today().year
+
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
 
@@ -303,11 +306,12 @@ def get_employees_by_department(unit_id):
             e.section,
             e.group_name,
             e.organization_unit_id,
+
             COALESCE(ms.status, 'draft') AS status,
             ms.reviewer_id,
             ms.approver_id,
 
-            -- Điểm công việc (approved_ey_score * approver_ti_trong / 100)
+            -- Điểm công việc (approved_ey_score * approver_ti_trong / 100) theo năm
             (
                 SELECT COALESCE(
                     SUM(ROUND(
@@ -316,10 +320,10 @@ def get_employees_by_department(unit_id):
                 )
                 FROM `{DB_SCHEMA}`.personalmbo p
                 WHERE p.employee_code = e.employee_code
-                  AND p.mbo_year = YEAR(CURDATE())
+                  AND p.mbo_year = %s
             ) AS job_score,
 
-            -- Điểm năng lực (approved_ey_score * approver_ti_trong / 100)
+            -- Điểm năng lực (approved_ey_score * approver_ti_trong / 100) theo năm
             (
                 SELECT COALESCE(
                     SUM(ROUND(
@@ -328,10 +332,10 @@ def get_employees_by_department(unit_id):
                 )
                 FROM `{DB_SCHEMA}`.competencymbo c
                 WHERE c.employee_code = e.employee_code
-                  AND c.mbo_year = YEAR(CURDATE())
+                  AND c.mbo_year = %s
             ) AS competency_score,
 
-            -- score_final: ưu tiên lấy từ ms.score_final; nếu NULL thì trung bình(job_score, competency_score)
+            -- score_final: ưu tiên ms.score_final; nếu NULL thì TB(job_score, competency_score) theo năm
             COALESCE(
                 ms.score_final,
                 (
@@ -343,9 +347,8 @@ def get_employees_by_department(unit_id):
                         )
                         FROM `{DB_SCHEMA}`.personalmbo p2
                         WHERE p2.employee_code = e.employee_code
-                          AND p2.mbo_year = YEAR(CURDATE())
-                    )
-                    +
+                          AND p2.mbo_year = %s
+                    ) +
                     (
                         SELECT COALESCE(
                             SUM(ROUND(
@@ -354,7 +357,7 @@ def get_employees_by_department(unit_id):
                         )
                         FROM `{DB_SCHEMA}`.competencymbo c2
                         WHERE c2.employee_code = e.employee_code
-                          AND c2.mbo_year = YEAR(CURDATE())
+                          AND c2.mbo_year = %s
                     )
                 ) / 2
             ) AS score_final,
@@ -372,10 +375,13 @@ def get_employees_by_department(unit_id):
         FROM `{DB_SCHEMA}`.employees2026 e
         JOIN descendants d ON e.organization_unit_id = d.id
         LEFT JOIN `{DB_SCHEMA}`.mbo_sessions ms 
-            ON e.id = ms.employee_id AND ms.mbo_year = YEAR(CURDATE())
+            ON e.id = ms.employee_id
+           AND ms.mbo_year = %s
     """
 
-    cursor.execute(query, (unit_id,))
+    # Tham số theo thứ tự: unit_id, rồi 5 lần năm (job_score, competency_score, p2, c2, ms)
+    params = (unit_id, mbo_year, mbo_year, mbo_year, mbo_year, mbo_year)
+    cursor.execute(query, params)
     employees = cursor.fetchall()
 
     cursor.close()
