@@ -38,9 +38,9 @@ def update_employee_count(unit_id, delta):
     conn.close()
 
 # ======= API =======
-# GET - Lấy danh sách nhân viên (có thể lọc theo phòng ban cha + phòng con)
 EMPLOYEE_TABLE = f"`{DB_SCHEMA}`.employees2026_base"  # bảng thật sau khi rename
 
+# GET - Lấy danh sách nhân viên
 @employees_bp.route('/list', methods=['GET'])
 def get_employees_list():
     org_id = request.args.get('org_id', type=int)
@@ -50,11 +50,10 @@ def get_employees_list():
 
     base_select = f"""
         SELECT e.id, e.entry_date, e.full_name, e.gender, e.employee_code,
-               e.birth_date, e.phone, e.position, e.corporation, e.company,
-               e.factory, e.division, e.sub_division, e.section, e.group_name,
-               e.note, e.organization_unit_id,
-               e.employment_status,        -- NEW
-               e.status_note,              -- NEW
+               e.birth_date, e.phone, e.position, e.cap_bac,
+               e.corporation, e.company, e.factory, e.division, e.sub_division,
+               e.section, e.group_name, e.note, e.organization_unit_id,
+               e.employment_status, e.status_note,
                ou.name AS organization_unit_name
         FROM {EMPLOYEE_TABLE} e
         LEFT JOIN organization_units ou ON e.organization_unit_id = ou.id
@@ -99,6 +98,7 @@ def get_employees_list():
     conn.close()
     return jsonify(rows)
 
+# POST - Thêm nhân viên
 @employees_bp.route('/add', methods=['POST'])
 def add_employee():
     data = request.json or {}
@@ -106,17 +106,21 @@ def add_employee():
     conn = get_connection()
     cursor = conn.cursor()
 
-    # Giá trị mặc định nếu client không truyền
     employment_status = data.get('employment_status') or 'active'
     status_note = data.get('status_note')
 
     cursor.execute(f"""
         INSERT INTO {EMPLOYEE_TABLE} (
             entry_date, full_name, gender, employee_code, birth_date, phone,
-            position, corporation, company, factory, division,
+            position, cap_bac,
+            corporation, company, factory, division,
             sub_division, section, group_name, note, organization_unit_id,
-            employment_status, status_note             -- NEW
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            employment_status, status_note
+        ) VALUES (
+            %s, %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s
+        )
     """, (
         data.get('entry_date'),
         data.get('full_name'),
@@ -125,6 +129,7 @@ def add_employee():
         data.get('birth_date'),
         data.get('phone'),
         data.get('position'),
+        data.get('cap_bac'),
         data.get('corporation'),
         data.get('company'),
         data.get('factory'),
@@ -134,11 +139,10 @@ def add_employee():
         data.get('group_name'),
         data.get('note'),
         data.get('organization_unit_id'),
-        employment_status,    # NEW
-        status_note           # NEW
+        employment_status,
+        status_note
     ))
 
-    # Cập nhật employee_count nếu có organization_unit_id và trạng thái là active
     if data.get('organization_unit_id') and employment_status == 'active':
         update_employee_count(data['organization_unit_id'], +1)
 
@@ -147,6 +151,7 @@ def add_employee():
     conn.close()
     return jsonify({"message": "Thêm nhân viên thành công"}), 201
 
+# PUT - Cập nhật nhân viên
 @employees_bp.route('/update/<int:id>', methods=['PUT'])
 def update_employee(id):
     data = request.json or {}
@@ -154,7 +159,6 @@ def update_employee(id):
     conn = get_connection()
     cursor = conn.cursor()
 
-    # Lấy hiện trạng
     cursor.execute(f"SELECT * FROM {EMPLOYEE_TABLE} WHERE id = %s", (id,))
     current = cursor.fetchone()
     if not current:
@@ -169,10 +173,10 @@ def update_employee(id):
     old_status = current_data.get('employment_status') or 'active'
     new_status = data.get('employment_status', old_status)
 
-    # Các trường chung
+    # Trường chung
     general_fields = [
         'entry_date', 'full_name', 'gender', 'employee_code', 'birth_date',
-        'phone', 'position', 'note'
+        'phone', 'position', 'cap_bac', 'note'  # cap_bac trước note
     ]
     department_fields = [
         'corporation', 'company', 'factory', 'division',
@@ -185,7 +189,6 @@ def update_employee(id):
     for field in department_fields:
         update_values.append(data.get(field, current_data[field]))
 
-    # NEW: thêm 2 field mới
     status_note = data.get('status_note', current_data.get('status_note'))
     update_values.extend([new_unit_id, new_status, status_note])
 
@@ -198,6 +201,7 @@ def update_employee(id):
             birth_date=%s,
             phone=%s,
             position=%s,
+            cap_bac=%s,
             note=%s,
             corporation=%s,
             company=%s,
@@ -207,19 +211,18 @@ def update_employee(id):
             section=%s,
             group_name=%s,
             organization_unit_id=%s,
-            employment_status=%s,     -- NEW
-            status_note=%s            -- NEW
+            employment_status=%s,
+            status_note=%s
         WHERE id=%s
     """, (*update_values, id))
 
-    # Cập nhật employee_count khi đổi phòng ban
+    # Cập nhật employee_count
     if old_unit_id != new_unit_id:
         if old_unit_id and old_status == 'active':
             update_employee_count(old_unit_id, -1)
         if new_unit_id and new_status == 'active':
             update_employee_count(new_unit_id, +1)
     else:
-        # Không đổi phòng ban, nhưng có thể đổi trạng thái
         if old_status != new_status and new_unit_id:
             if old_status == 'active' and new_status == 'terminated':
                 update_employee_count(new_unit_id, -1)
@@ -238,7 +241,6 @@ def delete_employee(id):
     cursor = conn.cursor()
 
     try:
-        # Lấy unit & trạng thái từ bảng GỐC
         cursor.execute(f"""
             SELECT organization_unit_id, employment_status
             FROM `{DB_SCHEMA}`.employees2026_base
@@ -253,11 +255,9 @@ def delete_employee(id):
 
         org_unit_id, employment_status = row[0], row[1]
 
-        # Nếu đang active thì trừ số lượng trước khi xoá
         if org_unit_id and (employment_status or 'active') == 'active':
             update_employee_count(org_unit_id, -1)
 
-        # Xoá bản ghi ở bảng GỐC
         cursor.execute(f"""
             DELETE FROM `{DB_SCHEMA}`.employees2026_base
             WHERE id = %s
@@ -271,6 +271,7 @@ def delete_employee(id):
     finally:
         cursor.close()
         conn.close()
+
 
 @employees_bp.route('/by-department/<int:unit_id>', methods=['GET'])
 def get_employees_by_department(unit_id):
@@ -456,13 +457,14 @@ def get_all_sub_unit_ids(start_ids, cursor):
 
 @employees_bp.route('/by-subordinates', methods=['POST'])
 def get_employees_for_allocation():
+    from datetime import date, datetime
+
     data = request.get_json()
     managed_ids = data.get("managed_organization_unit_ids")
     current_user_id = data.get("current_user_id")
 
     if not managed_ids or not isinstance(managed_ids, list):
         return jsonify({"error": "Thiếu managed_organization_unit_ids"}), 400
-
     if not current_user_id:
         return jsonify({"error": "Thiếu current_user_id"}), 400
 
@@ -470,84 +472,136 @@ def get_employees_for_allocation():
     cursor = conn.cursor(dictionary=True)
 
     try:
-        result_employees = []
+        # 1) Preload toàn bộ organization_units
+        cursor.execute("""
+            SELECT id, parent_id, employee_id
+            FROM organization_units
+        """)
+        units = cursor.fetchall()
 
-        def find_first_managers_recursively(unit_id):
+        # Build maps
+        children_map = {}
+        unit_by_id = {}
+        for u in units:
+            unit_by_id[u["id"]] = u
+            children_map.setdefault(u["parent_id"], []).append(u)
+
+        def find_first_managers_bfs(start_unit_id, current_user_id):
             """
-            Tìm người quản lý cấp dưới đầu tiên của unit_id (nếu unit đó không có người quản lý trực tiếp).
-            Dừng ngay khi tìm thấy cấp có người quản lý.
+            BFS từ start_unit_id để tìm 'độ sâu đầu tiên' có ít nhất 1 unit có employee_id (≠ current_user_id).
+            Trả về: set(employee_ids) nếu tìm được; ngược lại trả về set() (không có quản lý trong toàn subtree).
             """
-            cursor.execute("""
-                SELECT id, employee_id
-                FROM organization_units
-                WHERE parent_id = %s
-            """, (unit_id,))
-            children = cursor.fetchall()
+            from collections import deque
 
-            # Lọc những đơn vị con có người quản lý (khác current_user_id)
-            managed_emp_ids = [row["employee_id"] for row in children if row["employee_id"] and row["employee_id"] != current_user_id]
+            visited = set()
+            q = deque()
+            q.append(start_unit_id)
+            visited.add(start_unit_id)
 
-            if managed_emp_ids:
-                # Nếu tìm được ít nhất một người quản lý ở cấp này, trả về luôn
-                return managed_emp_ids
-            else:
-                # Không có người quản lý ở cấp này → tiếp tục tìm cấp con
-                collected = []
-                for child in children:
-                    collected += find_first_managers_recursively(child["id"])
-                return collected
+            while q:
+                level_size = len(q)
+                found_managers = set()
+
+                # Duyệt từng level một
+                for _ in range(level_size):
+                    uid = q.popleft()
+                    u = unit_by_id.get(uid)
+                    # Kiểm tra quản lý ở node hiện tại
+                    if u and u.get("employee_id") and u["employee_id"] != current_user_id:
+                        found_managers.add(u["employee_id"])
+                    # Thêm con vào hàng đợi
+                    for child in children_map.get(uid, []):
+                        cid = child["id"]
+                        if cid not in visited:
+                            visited.add(cid)
+                            q.append(cid)
+
+                # Nếu level này có >=1 quản lý → trả về luôn (độ sâu đầu tiên)
+                if found_managers:
+                    return found_managers
+
+            # Duyệt hết mà không thấy quản lý
+            return set()
+
+        def collect_leaf_units(start_unit_id):
+            """
+            Thu thập tất cả unit lá (không có con) trong subtree của start_unit_id.
+            """
+            leaves = set()
+            stack = [start_unit_id]
+            visited = set([start_unit_id])
+            while stack:
+                uid = stack.pop()
+                childs = children_map.get(uid, [])
+                if not childs:
+                    leaves.add(uid)
+                else:
+                    for c in childs:
+                        cid = c["id"]
+                        if cid not in visited:
+                            visited.add(cid)
+                            stack.append(cid)
+            return leaves
+
+        all_manager_ids = set()
+        all_leaf_unit_ids = set()
 
         for managed_id in managed_ids:
-            # 1. Tìm đơn vị con trực tiếp
-            cursor.execute("""
-                SELECT id, employee_id
-                FROM organization_units
-                WHERE parent_id = %s
-            """, (managed_id,))
-            children = cursor.fetchall()
+            # Lấy các đơn vị con trực tiếp của managed_id (nhánh cấp 1)
+            direct_children = children_map.get(managed_id, [])
+            if not direct_children:
+                # Nếu managed_id không có con → coi chính nó là 1 nhánh để fallback lá
+                direct_children = [{"id": managed_id}]
 
-            # 2. Tìm người quản lý trực tiếp cấp dưới (nếu có)
-            emp_ids = [row["employee_id"] for row in children if row["employee_id"] and row["employee_id"] != current_user_id]
+            # XỬ LÝ TỪNG NHÁNH CON
+            for child in direct_children:
+                cid = child["id"]
 
-            if emp_ids:
-                emp_format = ','.join(['%s'] * len(emp_ids))
-                cursor.execute(
-                    f"SELECT * FROM `{DB_SCHEMA}`.employees2026 WHERE id IN ({emp_format})",
-                    tuple(emp_ids)
-                )
-                result_employees.extend(cursor.fetchall())
-            else:
-                # ❌ Không có người quản lý trực tiếp ở cấp dưới → tìm đệ quy
-                recursive_emp_ids = find_first_managers_recursively(managed_id)
-
-                if recursive_emp_ids:
-                    emp_format = ','.join(['%s'] * len(recursive_emp_ids))
-                    cursor.execute(
-                        f"SELECT * FROM `{DB_SCHEMA}`.employees2026 WHERE id IN ({emp_format})",
-                        tuple(recursive_emp_ids)
-                    )
-                    result_employees.extend(cursor.fetchall())
+                mgrs = find_first_managers_bfs(cid, current_user_id=current_user_id)
+                if mgrs:
+                    # Có quản lý ở "độ sâu đầu tiên" của nhánh này → gom các quản lý này
+                    all_manager_ids.update(mgrs)
                 else:
-                    # ✅ Không có quản lý cấp dưới nào → lấy nhân viên trong đơn vị đó
-                    cursor.execute(f"""
-                        SELECT *
-                        FROM `{DB_SCHEMA}`.employees2026
-                        WHERE organization_unit_id = %s AND id != %s
-                    """, (managed_id, current_user_id))
-                    result_employees.extend(cursor.fetchall())
+                    # Không có quản lý ở bất kỳ cấp nào → gom tất cả lá của nhánh này
+                    all_leaf_unit_ids.update(collect_leaf_units(cid))
 
-        # Loại trùng và định dạng ngày
+        # 2) Query thông tin cho các quản lý đã tìm thấy
+        result_rows = []
+        if all_manager_ids:
+            placeholders = ",".join(["%s"] * len(all_manager_ids))
+            cursor.execute(
+                f"SELECT * FROM `{DB_SCHEMA}`.employees2026 WHERE id IN ({placeholders})",
+                tuple(all_manager_ids),
+            )
+            result_rows.extend(cursor.fetchall())
+
+        # 3) Query nhân viên thuộc các phòng ban lá (loại bỏ current_user_id)
+        if all_leaf_unit_ids:
+            placeholders = ",".join(["%s"] * len(all_leaf_unit_ids))
+            cursor.execute(
+                f"""
+                SELECT *
+                FROM `{DB_SCHEMA}`.employees2026
+                WHERE organization_unit_id IN ({placeholders})
+                  AND id != %s
+                """,
+                tuple(all_leaf_unit_ids) + (current_user_id,),
+            )
+            result_rows.extend(cursor.fetchall())
+
+        # 4) Khử trùng lặp + chuẩn hoá ngày
         seen = set()
-        final_result = []
-        for emp in result_employees:
-            if emp['id'] not in seen:
-                seen.add(emp['id'])
-                for field in ['entry_date', 'birth_date']:
+        final = []
+        for emp in result_rows:
+            emp_id = emp.get("id")
+            if emp_id and emp_id not in seen:
+                seen.add(emp_id)
+                for field in ("entry_date", "birth_date"):
                     if isinstance(emp.get(field), (date, datetime)):
                         emp[field] = emp[field].isoformat()
-                final_result.append(emp)
+                final.append(emp)
 
-        return jsonify(final_result)
+        return jsonify(final)
 
     finally:
         cursor.close()

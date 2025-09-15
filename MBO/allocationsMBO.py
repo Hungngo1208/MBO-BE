@@ -111,7 +111,7 @@ def get_allocations_by_sender():
             SELECT a.id, a.goal_id, a.sender_code, a.receiver_code, a.allocation_value, a.created_at,
                    e.full_name AS receiver_fullname
             FROM mbo_allocations a
-            JOIN employees e ON a.receiver_code = e.code
+            JOIN employees2026 e ON a.receiver_code = e.employee_code
             WHERE a.sender_code = %s
               AND a.mbo_year = %s
         """
@@ -135,6 +135,139 @@ def get_allocations_by_sender():
         print("Lỗi:", e)
         return jsonify({"error": str(e)}), 500
 
+    finally:
+        try:
+            cursor.close()
+            conn.close()
+        except Exception:
+            pass
+# =========================
+# Cập nhật giá trị phân bổ
+# =========================
+@allocations_bp.route("/allocations/<int:allocation_id>", methods=["PUT", "PATCH"])
+def update_allocation_value(allocation_id: int):
+    """
+    Body:
+    {
+      "allocation_value": 45,        # bắt buộc, số >= 0
+      "sender_code": "E001"          # optional: nếu truyền, kiểm tra đúng người gửi mới cho sửa
+    }
+    """
+    payload = request.get_json() or {}
+
+    if "allocation_value" not in payload:
+        return jsonify({"error": "Thiếu allocation_value"}), 400
+
+    # Validate allocation_value là số và >= 0
+    try:
+        allocation_value = int(payload.get("allocation_value"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "allocation_value phải là số"}), 400
+
+    if allocation_value < 0:
+        return jsonify({"error": "allocation_value phải >= 0"}), 400
+
+    sender_code = payload.get("sender_code")
+
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        # Kiểm tra bảng có cột updated_at không
+        cursor.execute("SHOW COLUMNS FROM mbo_allocations LIKE 'updated_at'")
+        has_updated_at = cursor.fetchone() is not None
+
+        # Dựng câu UPDATE theo điều kiện có/không có updated_at
+        if sender_code:
+            if has_updated_at:
+                query = """
+                    UPDATE mbo_allocations
+                    SET allocation_value = %s, updated_at = NOW()
+                    WHERE id = %s AND sender_code = %s
+                """
+            else:
+                query = """
+                    UPDATE mbo_allocations
+                    SET allocation_value = %s
+                    WHERE id = %s AND sender_code = %s
+                """
+            params = (allocation_value, allocation_id, sender_code)
+        else:
+            if has_updated_at:
+                query = """
+                    UPDATE mbo_allocations
+                    SET allocation_value = %s, updated_at = NOW()
+                    WHERE id = %s
+                """
+            else:
+                query = """
+                    UPDATE mbo_allocations
+                    SET allocation_value = %s
+                    WHERE id = %s
+                """
+            params = (allocation_value, allocation_id)
+
+        cursor.execute(query, params)
+        conn.commit()
+
+        if cursor.rowcount == 0:
+            return jsonify({"error": "Không tìm thấy bản ghi phù hợp để cập nhật"}), 404
+
+        return jsonify({
+            "message": "Cập nhật allocation_value thành công",
+            "id": allocation_id,
+            "allocation_value": allocation_value
+        }), 200
+
+    except Exception as e:
+        print("Lỗi:", e)
+        return jsonify({"error": str(e)}), 500
+    finally:
+        try:
+            cursor.close()
+            conn.close()
+        except Exception:
+            pass
+
+# =================
+# Xoá bản ghi phân bổ
+# =================
+@allocations_bp.route("/allocations/<int:allocation_id>", methods=["DELETE"])
+def delete_allocation(allocation_id: int):
+    """
+    Body (optional):
+    {
+      "sender_code": "E001"   # optional: nếu truyền, chỉ cho phép xoá khi đúng người gửi
+    }
+    """
+    payload = request.get_json(silent=True) or {}
+    sender_code = payload.get("sender_code")
+
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        if sender_code:
+            query = "DELETE FROM mbo_allocations WHERE id = %s AND sender_code = %s"
+            params = (allocation_id, sender_code)
+        else:
+            query = "DELETE FROM mbo_allocations WHERE id = %s"
+            params = (allocation_id,)
+
+        cursor.execute(query, params)
+        conn.commit()
+
+        if cursor.rowcount == 0:
+            return jsonify({"error": "Không tìm thấy bản ghi để xoá"}), 404
+
+        return jsonify({
+            "message": "Xoá phân bổ thành công",
+            "id": allocation_id
+        }), 200
+
+    except Exception as e:
+        print("Lỗi:", e)
+        return jsonify({"error": str(e)}), 500
     finally:
         try:
             cursor.close()
