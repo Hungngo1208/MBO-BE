@@ -153,22 +153,30 @@ def get_settings():
     db = get_connection()
     cur = db.cursor(dictionary=True)
     try:
-        cur.execute("SELECT current_year FROM mbo_settings LIMIT 1")
+        # luôn lấy đúng 1 bản ghi theo id = 1
+        cur.execute("SELECT current_year FROM mbo_settings WHERE id = 1")
         row = cur.fetchone()
+
         if not row:
-            # nếu chưa có thì khởi tạo mặc định bằng năm hiện tại
             year_now = datetime.now().year
             cur2 = db.cursor()
-            cur2.execute("INSERT INTO mbo_settings (current_year) VALUES (%s)", (year_now,))
-            db.commit()
-            cur2.close()
-            row = {"current_year": year_now}
-        return jsonify(row)
+            try:
+                # tạo bản ghi id=1 nếu chưa có; nếu có thì cập nhật
+                cur2.execute("""
+                    INSERT INTO mbo_settings (id, current_year)
+                    VALUES (1, %s)
+                    ON DUPLICATE KEY UPDATE current_year = VALUES(current_year)
+                """, (year_now,))
+                db.commit()
+                row = {"current_year": year_now}
+            finally:
+                cur2.close()
+
+        # đảm bảo format JSON nhất quán
+        return jsonify({"current_year": int(row["current_year"])})
     finally:
         cur.close()
         db.close()
-
-
 @mbo_timeline_bpp.route("/mbo/settings", methods=["PUT"])
 def update_settings():
     payload = request.get_json(silent=True) or {}
