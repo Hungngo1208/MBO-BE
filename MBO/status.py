@@ -154,3 +154,176 @@ def can_submit_mbo(employee_id: int):
             if conn: conn.close()
         except:
             pass
+@status_bp.post("/mbo/force-draft/<int:employee_id>")
+def force_draft(employee_id: int):
+    """
+    Đưa status MBO về 'draft' và reset các trường review/approve
+    theo đúng employee_code + mbo_year. Không dùng start_transaction().
+    """
+    from mysql.connector import Error
+    payload = request.get_json(silent=True) or {}
+    year = (
+        payload.get("mbo_year")
+        or payload.get("year")
+        or request.args.get("mbo_year", type=int)
+        or request.args.get("year", type=int)
+    )
+
+    TABLE_COMP = "nsh.competencymbo"
+    TABLE_PERS = "nsh.personalmbo"
+
+    REQUIRED_COMP_COLS = ["employee_code", "mbo_year", "reviewer_ti_trong", "approver_ti_trong"]
+    REQUIRED_PERS_COLS = ["employee_code", "mbo_year",
+                          "reviewer_ti_trong", "approver_ti_trong",
+                          "reviewer_rating", "approver_rating"]
+
+    def check_table_cols(cur, schema_table, required_cols):
+        schema, table = schema_table.split(".", 1) if "." in schema_table else (None, schema_table)
+        params = [table]
+        sql = """
+            SELECT COLUMN_NAME
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_NAME = %s
+        """
+        if schema:
+            sql += " AND TABLE_SCHEMA = %s"
+            params.append(schema)
+        cur.execute(sql, tuple(params))
+        have = {row["COLUMN_NAME"].lower() for row in cur.fetchall()}
+        missing = [c for c in required_cols if c.lower() not in have]
+        return missing
+
+    conn = None
+    cur = None
+    try:
+        conn = get_connection()
+        conn.autocommit = False  # ✅ QUAN TRỌNG: tự quản lý transaction, KHÔNG dùng start_transaction
+        cur = conn.cursor(dictionary=True)
+
+        # 0) employee_code
+        cur.execute("SELECT employee_code FROM employees2026 WHERE id=%s", (employee_id,))
+        emp = cur.fetchone()
+        if not emp or not emp.get("employee_code"):
+            return jsonify({
+                "ok": False, "employee_id": employee_id, "employee_code": None,
+                "mbo_year": year, "message": f"Không tìm thấy employee_code cho employee_id={employee_id}."
+            }), 404
+        employee_code = emp["employee_code"]
+
+        # 1) mbo_year
+        if not year:
+            cur.execute(
+                """
+                SELECT mbo_year
+                FROM mbo_sessions
+                WHERE employee_id=%s
+                ORDER BY mbo_year DESC, id DESC
+                LIMIT 1
+                """,
+                (employee_id,)
+            )
+            latest = cur.fetchone()
+            if not latest or not latest.get("mbo_year"):
+                return jsonify({
+                    "ok": False, "employee_id": employee_id, "employee_code": employee_code,
+                    "mbo_year": None, "message": "Không nhận được 'mbo_year' và cũng không tìm thấy phiên MBO để suy ra năm."
+                }), 400
+            year = int(latest["mbo_year"])
+
+        # 2) session đúng năm
+        cur.execute(
+            """
+            SELECT id, status, mbo_year
+            FROM mbo_sessions
+            WHERE employee_id=%s AND mbo_year=%s
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (employee_id, year)
+        )
+        sess = cur.fetchone()
+        if not sess:
+            return jsonify({
+                "ok": False, "employee_id": employee_id, "employee_code": employee_code,
+                "mbo_year": year, "message": f"Không tìm thấy MBO session cho employee_id={employee_id} năm {year}."
+            }), 404
+        session_id = sess["id"]
+        prev_status = (sess.get("status") or "").strip().lower()
+
+        # 3) validate schema
+        miss_comp = check_table_cols(cur, TABLE_COMP, REQUIRED_COMP_COLS)
+        miss_pers = check_table_cols(cur, TABLE_PERS, REQUIRED_PERS_COLS)
+        if miss_comp or miss_pers:
+            return jsonify({
+                "ok": False, "employee_id": employee_id, "employee_code": employee_code,
+                "mbo_year": year, "session_id": session_id, "previous_status": prev_status,
+                "missing_columns": {TABLE_COMP: miss_comp, TABLE_PERS: miss_pers},
+                "message": "Thiếu cột bắt buộc ở bảng mục tiêu. Vui lòng đồng bộ schema."
+            }), 400
+
+        # 4) Transaction (autocommit=False, KHÔNG gọi start_transaction)
+        # 4.1) Reset competencymbo
+        cur.execute(
+            f"""
+            UPDATE {TABLE_COMP}
+            SET reviewer_ti_trong = NULL,
+                approver_ti_trong = NULL
+            WHERE employee_code = %s
+              AND mbo_year = %s
+            """,
+            (employee_code, year)
+        )
+        affected_comp = cur.rowcount
+
+        # 4.2) Reset personalmbo
+        cur.execute(
+            f"""
+            UPDATE {TABLE_PERS}
+            SET reviewer_ti_trong = NULL,
+                approver_ti_trong = NULL,
+                reviewer_rating   = NULL,
+                approver_rating   = NULL
+            WHERE employee_code = %s
+              AND mbo_year = %s
+            """,
+            (employee_code, year)
+        )
+        affected_personal = cur.rowcount
+
+        # 4.3) Set session -> draft nếu cần
+        if prev_status != "draft":
+            cur.execute("UPDATE mbo_sessions SET status='draft' WHERE id=%s", (session_id,))
+
+        conn.commit()  # ✅ commit toàn bộ
+
+        return jsonify({
+            "ok": True,
+            "employee_id": employee_id,
+            "employee_code": employee_code,
+            "mbo_year": year,
+            "session_id": session_id,
+            "previous_status": prev_status,
+            "new_status": "draft",
+            "affected": {
+                "competencymbo": int(affected_comp or 0),
+                "personalmbo": int(affected_personal or 0),
+            },
+            "message": "Đã reset các trường đánh giá/duyệt theo đúng năm và đưa trạng thái MBO về 'draft' thành công."
+        })
+
+    except Error as e:
+        if conn and conn.in_transaction:
+            try: conn.rollback()
+            except: pass
+        return jsonify({
+            "ok": False,
+            "employee_id": employee_id,
+            "mbo_year": year,
+            "message": f"Lỗi cơ sở dữ liệu: {str(e)}"
+        }), 500
+    finally:
+        try:
+            if cur: cur.close()
+            if conn: conn.close()
+        except:
+            pass

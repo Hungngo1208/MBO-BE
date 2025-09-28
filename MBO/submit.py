@@ -13,22 +13,26 @@ LEVEL_ORDER = [
 # Helper: require mbo_year 2000..2100
 # -------------------------------
 def _require_mbo_year():
-    mbo_year = None
-    if request.is_json:
-        mbo_year = (request.get_json(silent=True) or {}).get('mbo_year')
-    if mbo_year is None:
-        mbo_year = request.args.get('mbo_year')  # chỉ chấp nhận ?mbo_year=YYYY
     try:
-        mbo_year = int(mbo_year)
-    except (TypeError, ValueError):
+        conn = get_connection()
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT current_year FROM nsh.mbo_settings LIMIT 1")
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+
+        if not row:
+            return None
+
+        mbo_year = int(row['current_year'])
+        if 2000 <= mbo_year <= 2100:
+            return mbo_year
         return None
-    if mbo_year < 2000 or mbo_year > 2100:
+    except Exception as e:
+        print("❌ _require_mbo_year error:", e)
         return None
-    return mbo_year
 
 
-# -------------------------------
-# SUBMIT
 # -------------------------------
 @submit_bp.route('/mbo/submit', methods=['POST'])
 def submit_mbo():
@@ -42,49 +46,49 @@ def submit_mbo():
         return jsonify({"error": "Thiếu hoặc sai định dạng mbo_year (2000..2100)"}), 400
 
     conn = get_connection()
-    cursor = conn.cursor(dictionary=True)
-
     try:
-        # 1) Lấy thông tin nhân viên
-        cursor.execute("SELECT * FROM employees2026 WHERE id = %s", (employee_id,))
-        emp = cursor.fetchone()
+        # 1) Lấy thông tin nhân viên (buffered)
+        with conn.cursor(dictionary=True, buffered=True) as cur:
+            cur.execute("SELECT * FROM employees2026 WHERE id = %s", (employee_id,))
+            emp = cur.fetchone()
         if not emp:
             return jsonify({"error": "employee not found"}), 404
 
         employee_code = emp['employee_code']
 
-        # 2) Xác định cấp cao nhất có giá trị
+        # 2) Xác định cấp cao nhất có giá trị (không cần DB)
         highest_level = None
         for level in reversed(LEVEL_ORDER):
             if emp.get(level):
                 highest_level = level
                 break
 
-        # 3) Kiểm tra có phải quản lý cấp cao nhất không
-        cursor.execute("""
-            SELECT * FROM organization_units
-            WHERE type = %s AND name = %s AND employee_id = %s
-        """, (highest_level, emp[highest_level] if highest_level else None, employee_id))
-        is_top_manager = cursor.fetchone()
+        # 3) Kiểm tra có phải quản lý cấp cao nhất không (buffered)
+        with conn.cursor(dictionary=True, buffered=True) as cur:
+            cur.execute("""
+                SELECT * FROM organization_units
+                WHERE type = %s AND name = %s AND employee_id = %s
+            """, (highest_level, emp[highest_level] if highest_level else None, employee_id))
+            is_top_manager = cur.fetchone()
 
         if is_top_manager:
             reviewer_id = employee_id
             approver_id = employee_id
         else:
-            # 4) Tìm reviewer
+            # 4) Tìm reviewer (buffered mỗi lần)
             reviewer_unit = None
             for level in LEVEL_ORDER[1:]:
                 unit_name = emp.get(level)
                 if unit_name:
-                    cursor.execute(
-                        "SELECT * FROM organization_units WHERE type = %s AND name = %s",
-                        (level, unit_name)
-                    )
-                    unit = cursor.fetchone()
+                    with conn.cursor(dictionary=True, buffered=True) as cur:
+                        cur.execute(
+                            "SELECT * FROM organization_units WHERE type = %s AND name = %s",
+                            (level, unit_name)
+                        )
+                        unit = cur.fetchone()
                     if unit and unit.get('employee_id') and unit['employee_id'] != employee_id:
                         reviewer_unit = unit
                         break
-
             reviewer_id = reviewer_unit['employee_id'] if reviewer_unit else employee_id
 
             # 5) Tìm approver
@@ -94,11 +98,12 @@ def submit_mbo():
                 upper_level = LEVEL_ORDER[i]
                 upper_name = emp.get(upper_level)
                 if upper_name:
-                    cursor.execute(
-                        "SELECT * FROM organization_units WHERE type = %s AND name = %s",
-                        (upper_level, upper_name)
-                    )
-                    unit = cursor.fetchone()
+                    with conn.cursor(dictionary=True, buffered=True) as cur:
+                        cur.execute(
+                            "SELECT * FROM organization_units WHERE type = %s AND name = %s",
+                            (upper_level, upper_name)
+                        )
+                        unit = cur.fetchone()
                     if unit and unit.get('employee_id') and unit['employee_id'] != employee_id:
                         approver_id = unit['employee_id']
                         break
@@ -120,19 +125,19 @@ def submit_mbo():
 
         auto_status = "submitted"
 
-        # 7) Auto update mục tiêu
+        # 7) Helpers — tất cả SELECT dùng buffered
         def auto_update_muctieu():
-            cur = conn.cursor(dictionary=True)
-            cur.execute("""
-                SELECT id, ti_trong, xep_loai
-                FROM PersonalMBO
-                WHERE employee_code = %s AND mbo_year = %s
-            """, (employee_code, mbo_year))
-            goals = cur.fetchall()
+            with conn.cursor(dictionary=True, buffered=True) as cur:
+                cur.execute("""
+                    SELECT id, ti_trong, xep_loai
+                    FROM PersonalMBO
+                    WHERE employee_code = %s AND mbo_year = %s
+                """, (employee_code, mbo_year))
+                goals = cur.fetchall()
             for g in goals:
                 with conn.cursor() as cu:
                     cu.execute("""
-                        UPDATE PersonalMBO SET 
+                        UPDATE PersonalMBO SET
                             reviewer_ti_trong = %s,
                             reviewer_rating   = %s,
                             approver_ti_trong = %s,
@@ -141,17 +146,17 @@ def submit_mbo():
                     """, (g['ti_trong'], g['xep_loai'], g['ti_trong'], g['xep_loai'], g['id'], mbo_year))
 
         def auto_update_competency():
-            cur = conn.cursor(dictionary=True)
-            cur.execute("""
-                SELECT id, ti_trong
-                FROM competencymbo
-                WHERE employee_code = %s AND mbo_year = %s
-            """, (employee_code, mbo_year))
-            goals = cur.fetchall()
+            with conn.cursor(dictionary=True, buffered=True) as cur:
+                cur.execute("""
+                    SELECT id, ti_trong
+                    FROM competencymbo
+                    WHERE employee_code = %s AND mbo_year = %s
+                """, (employee_code, mbo_year))
+                goals = cur.fetchall()
             for g in goals:
                 with conn.cursor() as cu:
                     cu.execute("""
-                        UPDATE competencymbo SET 
+                        UPDATE competencymbo SET
                             reviewer_ti_trong = %s,
                             approver_ti_trong = %s
                         WHERE id = %s AND mbo_year = %s
@@ -173,7 +178,7 @@ def submit_mbo():
                     WHERE employee_id = %s AND mbo_year = %s
                 """, (employee_id, mbo_year))
 
-        # Case 1: người lập = reviewer = approver
+        # Case 1
         if reviewer_id == approver_id == employee_id:
             auto_update_muctieu()
             auto_update_competency()
@@ -181,33 +186,37 @@ def submit_mbo():
             approve_now()
             auto_status = "approved"
 
-        # Case 2: reviewer = approver ≠ người lập
+        # Case 2
         elif reviewer_id == approver_id and reviewer_id != employee_id:
-            with conn.cursor(dictionary=True) as cur:
+            # copy reviewer -> approver cho từng mục tiêu
+            with conn.cursor(dictionary=True, buffered=True) as cur:
                 cur.execute("""
                     SELECT id FROM PersonalMBO
                     WHERE employee_code = %s AND mbo_year = %s
                 """, (employee_code, mbo_year))
-                for g in cur.fetchall():
-                    with conn.cursor() as cu:
-                        cu.execute("""
-                            UPDATE PersonalMBO SET 
-                                approver_ti_trong = reviewer_ti_trong,
-                                approver_rating   = reviewer_rating
-                            WHERE id = %s AND mbo_year = %s
-                        """, (g['id'], mbo_year))
+                pgoals = cur.fetchall()
+            for g in pgoals:
+                with conn.cursor() as cu:
+                    cu.execute("""
+                        UPDATE PersonalMBO SET
+                            approver_ti_trong = reviewer_ti_trong,
+                            approver_rating   = reviewer_rating
+                        WHERE id = %s AND mbo_year = %s
+                    """, (g['id'], mbo_year))
 
+            with conn.cursor(dictionary=True, buffered=True) as cur:
                 cur.execute("""
                     SELECT id FROM competencymbo
                     WHERE employee_code = %s AND mbo_year = %s
                 """, (employee_code, mbo_year))
-                for g in cur.fetchall():
-                    with conn.cursor() as cu:
-                        cu.execute("""
-                            UPDATE competencymbo SET 
-                                approver_ti_trong = reviewer_ti_trong
-                            WHERE id = %s AND mbo_year = %s
-                        """, (g['id'], mbo_year))
+                cgoals = cur.fetchall()
+            for g in cgoals:
+                with conn.cursor() as cu:
+                    cu.execute("""
+                        UPDATE competencymbo SET
+                            approver_ti_trong = reviewer_ti_trong
+                        WHERE id = %s AND mbo_year = %s
+                    """, (g['id'], mbo_year))
 
             review_now()
             auto_status = "reviewed"
@@ -227,7 +236,6 @@ def submit_mbo():
         print("❌ submit_mbo error:", e)
         return jsonify({"error": "submit_mbo failed", "detail": str(e)}), 500
     finally:
-        cursor.close()
         conn.close()
 
 
