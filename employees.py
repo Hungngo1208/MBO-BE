@@ -788,3 +788,144 @@ def update_score_final():
     finally:
         cursor.close()
         conn.close()
+@employees_bp.route('/by-code/<employee_code>', methods=['GET'])
+def get_employee_summary_by_code(employee_code):
+    from datetime import date
+    mbo_year = request.args.get('mbo_year', type=int) or date.today().year
+
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci")
+
+    query = f"""
+        WITH
+        job AS (
+            SELECT p.employee_code,
+                   ROUND(SUM((COALESCE(p.approved_ey_score,0) * COALESCE(p.approver_ti_trong,0))/100), 2) AS job_score
+            FROM `{DB_SCHEMA}`.personalmbo p
+            WHERE p.mbo_year = %s
+              AND p.employee_code COLLATE utf8mb4_unicode_ci = %s COLLATE utf8mb4_unicode_ci
+            GROUP BY p.employee_code
+        ),
+        comp AS (
+            SELECT c.employee_code,
+                   ROUND(SUM((COALESCE(c.approved_ey_score,0) * COALESCE(c.approver_ti_trong,0))/100), 2) AS competency_score
+            FROM `{DB_SCHEMA}`.competencymbo c
+            WHERE c.mbo_year = %s
+              AND c.employee_code COLLATE utf8mb4_unicode_ci = %s COLLATE utf8mb4_unicode_ci
+            GROUP BY c.employee_code
+        ),
+        att AS (
+            SELECT a.employee_code,
+                   ROUND(AVG(a.score), 2) AS attitude_score
+            FROM `{DB_SCHEMA}`.attitudembo a
+            WHERE a.mbo_year = %s
+              AND a.employee_code COLLATE utf8mb4_unicode_ci = %s COLLATE utf8mb4_unicode_ci
+            GROUP BY a.employee_code
+        )
+        SELECT
+            e.id,
+            e.full_name,
+            e.employee_code,
+            e.position,
+            e.phone,
+            e.entry_date,
+            e.birth_date,
+            e.gender,
+            e.note,
+            e.corporation,
+            e.company,
+            e.factory,
+            e.division,
+            e.sub_division,
+            e.section,
+            e.group_name,
+            e.organization_unit_id,
+
+            COALESCE(ms.status, 'draft') AS status,
+            ms.reviewer_id,
+            ms.approver_id,
+            ms.score_final AS ms_score_final,
+            COALESCE(ms.attitude_status, 'none') AS attitude_status,
+
+            COALESCE(j.job_score, 0)         AS job_score,
+            COALESCE(cp.competency_score, 0) AS competency_score,
+            COALESCE(a.attitude_score, 0)    AS attitude_score,
+
+            /* computed_final theo position */
+            CASE
+              /* Trưởng nhóm / Phó nhóm / Team lead / ' tl ' */
+              WHEN  LOWER(e.position) REGEXP 'trưởng[[:space:]]*nhóm|truong[[:space:]]*nhom|phó[[:space:]]*nhóm|pho[[:space:]]*nhom|team[[:space:]]*lead'
+                 OR  CONCAT(' ', LOWER(e.position), ' ') LIKE '% tl %'
+              THEN ROUND( 0.10 * COALESCE(a.attitude_score,0)
+                        + 0.45 * COALESCE(j.job_score,0)
+                        + 0.45 * COALESCE(cp.competency_score,0), 2)
+
+              /* Nhân viên */
+              WHEN  LOWER(e.position) REGEXP 'nhân[[:space:]]*viên|nhan[[:space:]]*vien|staff|employee'
+              THEN ROUND( 0.20 * COALESCE(a.attitude_score,0)
+                        + 0.40 * COALESCE(j.job_score,0)
+                        + 0.40 * COALESCE(cp.competency_score,0), 2)
+
+              /* Cấp khác: bỏ thái độ */
+              ELSE ROUND( 0.50 * COALESCE(j.job_score,0)
+                        + 0.50 * COALESCE(cp.competency_score,0), 2)
+            END AS computed_final,
+
+            /* score_final ưu tiên ms.score_final */
+            CASE
+              WHEN ms.score_final IS NOT NULL THEN ROUND(ms.score_final, 2)
+              ELSE
+                CASE
+                  WHEN  LOWER(e.position) REGEXP 'trưởng[[:space:]]*nhóm|truong[[:space:]]*nhom|phó[[:space:]]*nhóm|pho[[:space:]]*nhom|team[[:space:]]*lead'
+                     OR  CONCAT(' ', LOWER(e.position), ' ') LIKE '% tl %'
+                  THEN ROUND( 0.10 * COALESCE(a.attitude_score,0)
+                            + 0.45 * COALESCE(j.job_score,0)
+                            + 0.45 * COALESCE(cp.competency_score,0), 2)
+                  WHEN  LOWER(e.position) REGEXP 'nhân[[:space:]]*viên|nhan[[:space:]]*vien|staff|employee'
+                  THEN ROUND( 0.20 * COALESCE(a.attitude_score,0)
+                            + 0.40 * COALESCE(j.job_score,0)
+                            + 0.40 * COALESCE(cp.competency_score,0), 2)
+                  ELSE ROUND( 0.50 * COALESCE(j.job_score,0)
+                            + 0.50 * COALESCE(cp.competency_score,0), 2)
+                END
+            END AS score_final,
+
+            /* Tên phòng ban nhỏ nhất */
+            CASE
+              WHEN e.group_name   IS NOT NULL AND e.group_name   <> '' THEN e.group_name
+              WHEN e.section      IS NOT NULL AND e.section      <> '' THEN e.section
+              WHEN e.sub_division IS NOT NULL AND e.sub_division <> '' THEN e.sub_division
+              WHEN e.division     IS NOT NULL AND e.division     <> '' THEN e.division
+              WHEN e.factory      IS NOT NULL AND e.factory      <> '' THEN e.factory
+              WHEN e.company      IS NOT NULL AND e.company      <> '' THEN e.company
+              WHEN e.corporation  IS NOT NULL AND e.corporation  <> '' THEN e.corporation
+              ELSE NULL
+            END AS department_name
+
+        FROM `{DB_SCHEMA}`.employees2026 e
+        LEFT JOIN job j    ON j.employee_code  COLLATE utf8mb4_unicode_ci = e.employee_code COLLATE utf8mb4_unicode_ci
+        LEFT JOIN comp cp  ON cp.employee_code COLLATE utf8mb4_unicode_ci = e.employee_code COLLATE utf8mb4_unicode_ci
+        LEFT JOIN att a    ON a.employee_code  COLLATE utf8mb4_unicode_ci = e.employee_code COLLATE utf8mb4_unicode_ci
+        LEFT JOIN `{DB_SCHEMA}`.mbo_sessions ms
+               ON ms.employee_id = e.id AND ms.mbo_year = %s
+        WHERE e.employee_code COLLATE utf8mb4_unicode_ci = %s COLLATE utf8mb4_unicode_ci
+        LIMIT 1
+    """
+
+    try:
+        # Param order: year/code, year/code, year/code, year, code
+        params = (
+            mbo_year, employee_code,
+            mbo_year, employee_code,
+            mbo_year, employee_code,
+            mbo_year, employee_code
+        )
+        cursor.execute(query, params)
+        row = cursor.fetchone()
+        if not row:
+            return jsonify({"error": "Not found", "employee_code": employee_code, "mbo_year": mbo_year}), 404
+        return jsonify(row)
+    finally:
+        cursor.close()
+        conn.close()
