@@ -116,3 +116,62 @@ def login():
             cursor.close()
         if conn and conn.is_connected():
             conn.close()
+@auth_bp.route('/api/change-password', methods=['POST'])
+def change_password():
+    """
+    Body JSON expected:
+    {
+      "username": "00001",
+      "old_password": "current_plain_text_password",
+      "new_password": "new_plain_text_password"
+    }
+    """
+    data = request.get_json() or {}
+    username = data.get('username')
+    old_password = data.get('old_password')
+    new_password = data.get('new_password')
+
+    if not username or not old_password or not new_password:
+        return jsonify({'error': 'username, old_password và new_password là bắt buộc'}), 400
+
+    # ✅ Chỉ cần tối thiểu 4 ký tự
+    if len(new_password) < 4:
+        return jsonify({'error': 'Mật khẩu mới phải có ít nhất 4 ký tự'}), 400
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        # Kiểm tra user tồn tại
+        cursor.execute("SELECT id, username, password_hash FROM users WHERE username = %s", (username,))
+        user = cursor.fetchone()
+        if not user:
+            return jsonify({'error': 'Tài khoản không tồn tại'}), 404
+
+        # Kiểm tra mật khẩu cũ
+        stored_hash = user.get('password_hash')
+        if not stored_hash or not check_password_hash(stored_hash, old_password):
+            return jsonify({'error': 'Mật khẩu hiện tại không đúng'}), 401
+
+        # Tạo hash mới (dùng scrypt để giữ format giống cũ)
+        new_hash = generate_password_hash(new_password, method='scrypt')
+
+        # ✅ Cập nhật mật khẩu (không có updated_at)
+        cursor.execute(
+            "UPDATE users SET password_hash = %s WHERE id = %s",
+            (new_hash, user['id'])
+        )
+        conn.commit()
+
+        return jsonify({'message': 'Đổi mật khẩu thành công'}), 200
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+    finally:
+        if cursor:
+            cursor.close()
+        if conn and conn.is_connected():
+            conn.close()
