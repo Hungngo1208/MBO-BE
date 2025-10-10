@@ -175,3 +175,79 @@ def change_password():
             cursor.close()
         if conn and conn.is_connected():
             conn.close()
+@auth_bp.route('/api/admin/reset-password', methods=['POST'])
+def admin_reset_password():
+    """
+    Body JSON expected:
+    {
+      "employee_id": 123,
+      "new_password": "new_plain_text_password"
+    }
+    """
+    data = request.get_json() or {}
+    employee_id = data.get('employee_id')
+    new_password = data.get('new_password')
+
+    if not employee_id or not new_password:
+        return jsonify({'error': 'employee_id và new_password là bắt buộc'}), 400
+
+    # ✅ Giữ quy tắc tương tự endpoint change-password của bạn
+    if len(new_password) < 4:
+        return jsonify({'error': 'Mật khẩu mới phải có ít nhất 4 ký tự'}), 400
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        # 1) Tìm employee_code từ employees2026
+        cursor.execute("""
+            SELECT e.id AS employee_id, e.employee_code
+            FROM employees2026 e
+            WHERE e.id = %s
+            LIMIT 1
+        """, (employee_id,))
+        emp = cursor.fetchone()
+        if not emp or not emp.get('employee_code'):
+            return jsonify({'error': 'Không tìm thấy nhân viên hoặc thiếu employee_code'}), 404
+
+        employee_code = emp['employee_code']
+
+        # 2) Tìm user tương ứng trong bảng users (username = employee_code)
+        cursor.execute("""
+            SELECT u.id, u.username
+            FROM users u
+            WHERE u.username = %s
+            LIMIT 1
+        """, (employee_code,))
+        user = cursor.fetchone()
+        if not user:
+            return jsonify({'error': 'Không tìm thấy tài khoản users tương ứng với employee_code'}), 404
+
+        # 3) Tạo password hash mới (giữ method='scrypt' như bạn đang dùng)
+        new_hash = generate_password_hash(new_password, method='scrypt')
+
+        # 4) Cập nhật users.password_hash
+        cursor.execute("""
+            UPDATE users
+            SET password_hash = %s
+            WHERE id = %s
+        """, (new_hash, user['id']))
+        conn.commit()
+
+        return jsonify({
+            'message': 'Reset mật khẩu thành công',
+            'username': user['username'],      # tiện cho phía frontend hiển thị
+            'employee_id': emp['employee_id']
+        }), 200
+
+    except Exception as e:
+        # Có thể log chi tiết e để audit
+        return jsonify({'error': str(e)}), 500
+
+    finally:
+        if cursor:
+            cursor.close()
+        if conn and conn.is_connected():
+            conn.close()

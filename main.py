@@ -14,6 +14,7 @@ from MBO.submit import submit_bp
 from MBO.timelineMBO import mbo_timeline_bpp, ensure_table  # <-- import ensure_table
 from MBO.status import status_bp
 from MBO.attitudeMBO import attitude_bp
+from ELearning.eln import eln_bp
 app = Flask(__name__)
 CORS(app)
 
@@ -31,6 +32,7 @@ app.register_blueprint(submit_bp)
 app.register_blueprint(mbo_timeline_bpp)   # MBO timeline (5 phase)
 app.register_blueprint(status_bp)
 app.register_blueprint(attitude_bp, url_prefix="/attitude")
+app.register_blueprint(eln_bp)
 # Đảm bảo bảng timeline tồn tại ngay khi app khởi động
 with app.app_context():
     ensure_table()
