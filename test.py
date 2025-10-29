@@ -1,6 +1,6 @@
 import pandas as pd
 
-file_path = r"C:\Users\ADMIN\Downloads\S.xlsx"
+file_path = r"C:\Users\ADMIN\Downloads\s.xlsx"
 df = pd.read_excel(file_path)
 
 # Lấy cột đầu tiên (cột A, index = 0)

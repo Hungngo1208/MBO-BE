@@ -290,44 +290,8 @@ def get_employees_by_department(unit_id):
             FROM organization_units o
             JOIN descendants d ON o.parent_id = d.id
         )
-        SELECT 
-            t.id,
-            t.full_name,
-            t.employee_code,
-            t.position,
-            t.phone,
-            t.entry_date,
-            t.birth_date,
-            t.gender,
-            t.note,
-            t.corporation,
-            t.company,
-            t.factory,
-            t.division,
-            t.sub_division,
-            t.section,
-            t.group_name,
-            t.organization_unit_id,
-            t.status,
-            t.reviewer_id,
-            t.approver_id,
-            t.job_score,
-            t.competency_score,
-            t.attitude_score,
-            t.attitude_status,
-
-            /* trả computed_final đã tính sẵn trong subquery */
-            t.computed_final,
-
-            /* score_final: nếu có ms_score_final thì dùng, không thì lấy computed_final */
-            CASE
-                WHEN t.ms_score_final IS NOT NULL
-                    THEN ROUND(t.ms_score_final, 2)
-                ELSE t.computed_final
-            END AS score_final,
-
-            t.department_name
-        FROM (
+        /* Lớp 1: tính sẵn các điểm REVIEWED/APPROVED + thái độ */
+        , base AS (
             SELECT
                 e.id,
                 e.full_name,
@@ -347,134 +311,77 @@ def get_employees_by_department(unit_id):
                 e.group_name,
                 e.organization_unit_id,
 
-                COALESCE(ms.status, 'draft') AS status,
+                COALESCE(ms.status, 'draft')       AS status,
                 ms.reviewer_id,
                 ms.approver_id,
-                ms.score_final AS ms_score_final,
-                COALESCE(ms.attitude_status, 'none') AS attitude_status,
+                ms.score_final                     AS ms_score_final,
+                COALESCE(ms.attitude_status,'none') AS attitude_status,
 
-                /* Điểm công việc */
+                /* Điểm công việc (REVIEWED) */
                 (
-                    SELECT COALESCE(
-                        SUM(ROUND(
-                            (COALESCE(p.approved_ey_score, 0) * COALESCE(p.approver_ti_trong, 0)) / 100
-                        , 2)), 0
-                    )
-                    FROM `{DB_SCHEMA}`.personalmbo p
-                    WHERE p.employee_code COLLATE utf8mb4_unicode_ci = e.employee_code COLLATE utf8mb4_unicode_ci
-                      AND p.mbo_year = %s
-                ) AS job_score,
+                  SELECT COALESCE(
+                    SUM(ROUND(
+                      (COALESCE(p.reviewed_ey_score, 0) * COALESCE(p.reviewer_ti_trong, 0)) / 100
+                    , 2)), 0
+                  )
+                  FROM `{DB_SCHEMA}`.personalmbo p
+                  WHERE p.employee_code COLLATE utf8mb4_unicode_ci = e.employee_code COLLATE utf8mb4_unicode_ci
+                    AND p.mbo_year = %s
+                ) AS job_score_reviewed,
 
-                /* Điểm năng lực */
+                /* Điểm công việc (APPROVED) */
                 (
-                    SELECT COALESCE(
-                        SUM(ROUND(
-                            (COALESCE(c.approved_ey_score, 0) * COALESCE(c.approver_ti_trong, 0)) / 100
-                        , 2)), 0
-                    )
-                    FROM `{DB_SCHEMA}`.competencymbo c
-                    WHERE c.employee_code COLLATE utf8mb4_unicode_ci = e.employee_code COLLATE utf8mb4_unicode_ci
-                      AND c.mbo_year = %s
-                ) AS competency_score,
+                  SELECT COALESCE(
+                    SUM(ROUND(
+                      (COALESCE(p.approved_ey_score, 0) * COALESCE(p.approver_ti_trong, 0)) / 100
+                    , 2)), 0
+                  )
+                  FROM `{DB_SCHEMA}`.personalmbo p
+                  WHERE p.employee_code COLLATE utf8mb4_unicode_ci = e.employee_code COLLATE utf8mb4_unicode_ci
+                    AND p.mbo_year = %s
+                ) AS job_score_approved,
 
-                /* Điểm thái độ: trung bình năm */
+                /* Điểm năng lực (REVIEWED) */
                 (
-                    SELECT COALESCE(ROUND(AVG(a.score), 2), 0)
-                    FROM `{DB_SCHEMA}`.attitudembo a
-                    WHERE a.employee_code COLLATE utf8mb4_unicode_ci = e.employee_code COLLATE utf8mb4_unicode_ci
-                      AND a.mbo_year = %s
-                ) AS attitude_score,
+                  SELECT COALESCE(
+                    SUM(ROUND(
+                      (COALESCE(c.reviewed_ey_score, 0) * COALESCE(c.reviewer_ti_trong, 0)) / 100
+                    , 2)), 0
+                  )
+                  FROM `{DB_SCHEMA}`.competencymbo c
+                  WHERE c.employee_code COLLATE utf8mb4_unicode_ci = e.employee_code COLLATE utf8mb4_unicode_ci
+                    AND c.mbo_year = %s
+                ) AS competency_score_reviewed,
 
-                /* computed_final: tính một lần dựa theo position */
+                /* Điểm năng lực (APPROVED) */
+                (
+                  SELECT COALESCE(
+                    SUM(ROUND(
+                      (COALESCE(c.approved_ey_score, 0) * COALESCE(c.approver_ti_trong, 0)) / 100
+                    , 2)), 0
+                  )
+                  FROM `{DB_SCHEMA}`.competencymbo c
+                  WHERE c.employee_code COLLATE utf8mb4_unicode_ci = e.employee_code COLLATE utf8mb4_unicode_ci
+                    AND c.mbo_year = %s
+                ) AS competency_score_approved,
+
+                /* Điểm thái độ (AVG theo năm, dùng cho cả reviewed/approved) */
+                (
+                  SELECT COALESCE(ROUND(AVG(a.score), 2), 0)
+                  FROM `{DB_SCHEMA}`.attitudembo a
+                  WHERE a.employee_code COLLATE utf8mb4_unicode_ci = e.employee_code COLLATE utf8mb4_unicode_ci
+                    AND a.mbo_year = %s
+                ) AS attitude_score_year,
+
+                /* Tên phòng ban nhỏ nhất để hiển thị */
                 CASE
-                    /* Trưởng nhóm / Phó nhóm / Team lead / ' tl ' */
-                    WHEN  LOWER(e.position) REGEXP 'trưởng[[:space:]]*nhóm|truong[[:space:]]*nhom|phó[[:space:]]*nhóm|pho[[:space:]]*nhom|team[[:space:]]*lead'
-                       OR  CONCAT(' ', LOWER(e.position), ' ') LIKE '% tl %'
-                    THEN ROUND(
-                          0.10 * COALESCE((
-                              SELECT COALESCE(ROUND(AVG(a2.score), 2), 0)
-                              FROM `{DB_SCHEMA}`.attitudembo a2
-                              WHERE a2.employee_code COLLATE utf8mb4_unicode_ci = e.employee_code COLLATE utf8mb4_unicode_ci
-                                AND a2.mbo_year = %s
-                          ), 0)
-                        + 0.45 * COALESCE((
-                              SELECT COALESCE(
-                                  SUM(ROUND(
-                                      (COALESCE(p2.approved_ey_score, 0) * COALESCE(p2.approver_ti_trong, 0)) / 100
-                                  , 2)), 0)
-                              FROM `{DB_SCHEMA}`.personalmbo p2
-                              WHERE p2.employee_code COLLATE utf8mb4_unicode_ci = e.employee_code COLLATE utf8mb4_unicode_ci
-                                AND p2.mbo_year = %s
-                          ), 0)
-                        + 0.45 * COALESCE((
-                              SELECT COALESCE(
-                                  SUM(ROUND(
-                                      (COALESCE(c2.approved_ey_score, 0) * COALESCE(c2.approver_ti_trong, 0)) / 100
-                                  , 2)), 0)
-                              FROM `{DB_SCHEMA}`.competencymbo c2
-                              WHERE c2.employee_code COLLATE utf8mb4_unicode_ci = e.employee_code COLLATE utf8mb4_unicode_ci
-                                AND c2.mbo_year = %s
-                          ), 0), 2)
-
-                    /* Nhân viên */
-                    WHEN  LOWER(e.position) REGEXP 'nhân[[:space:]]*viên|nhan[[:space:]]*vien|staff|employee'
-                    THEN ROUND(
-                          0.20 * COALESCE((
-                              SELECT COALESCE(ROUND(AVG(a3.score), 2), 0)
-                              FROM `{DB_SCHEMA}`.attitudembo a3
-                              WHERE a3.employee_code COLLATE utf8mb4_unicode_ci = e.employee_code COLLATE utf8mb4_unicode_ci
-                                AND a3.mbo_year = %s
-                          ), 0)
-                        + 0.40 * COALESCE((
-                              SELECT COALESCE(
-                                  SUM(ROUND(
-                                      (COALESCE(p3.approved_ey_score, 0) * COALESCE(p3.approver_ti_trong, 0)) / 100
-                                  , 2)), 0)
-                              FROM `{DB_SCHEMA}`.personalmbo p3
-                              WHERE p3.employee_code COLLATE utf8mb4_unicode_ci = e.employee_code COLLATE utf8mb4_unicode_ci
-                                AND p3.mbo_year = %s
-                          ), 0)
-                        + 0.40 * COALESCE((
-                              SELECT COALESCE(
-                                  SUM(ROUND(
-                                      (COALESCE(c3.approved_ey_score, 0) * COALESCE(c3.approver_ti_trong, 0)) / 100
-                                  , 2)), 0)
-                              FROM `{DB_SCHEMA}`.competencymbo c3
-                              WHERE c3.employee_code COLLATE utf8mb4_unicode_ci = e.employee_code COLLATE utf8mb4_unicode_ci
-                                AND c3.mbo_year = %s
-                          ), 0), 2)
-
-                    /* Cấp khác: bỏ thái độ */
-                    ELSE ROUND(
-                          0.50 * COALESCE((
-                              SELECT COALESCE(
-                                  SUM(ROUND(
-                                      (COALESCE(p4.approved_ey_score, 0) * COALESCE(p4.approver_ti_trong, 0)) / 100
-                                  , 2)), 0)
-                              FROM `{DB_SCHEMA}`.personalmbo p4
-                              WHERE p4.employee_code COLLATE utf8mb4_unicode_ci = e.employee_code COLLATE utf8mb4_unicode_ci
-                                AND p4.mbo_year = %s
-                          ), 0)
-                        + 0.50 * COALESCE((
-                              SELECT COALESCE(
-                                  SUM(ROUND(
-                                      (COALESCE(c4.approved_ey_score, 0) * COALESCE(c4.approver_ti_trong, 0)) / 100
-                                  , 2)), 0)
-                              FROM `{DB_SCHEMA}`.competencymbo c4
-                              WHERE c4.employee_code COLLATE utf8mb4_unicode_ci = e.employee_code COLLATE utf8mb4_unicode_ci
-                                AND c4.mbo_year = %s
-                          ), 0), 2)
-                END AS computed_final,
-
-                /* Tên phòng ban nhỏ nhất */
-                CASE
-                    WHEN e.group_name IS NOT NULL AND e.group_name != '' THEN e.group_name
-                    WHEN e.section IS NOT NULL AND e.section != '' THEN e.section
-                    WHEN e.sub_division IS NOT NULL AND e.sub_division != '' THEN e.sub_division
-                    WHEN e.division IS NOT NULL AND e.division != '' THEN e.division
-                    WHEN e.factory IS NOT NULL AND e.factory != '' THEN e.factory
-                    WHEN e.company IS NOT NULL AND e.company != '' THEN e.company
-                    WHEN e.corporation IS NOT NULL AND e.corporation != '' THEN e.corporation
+                    WHEN e.group_name      IS NOT NULL AND e.group_name      != '' THEN e.group_name
+                    WHEN e.section         IS NOT NULL AND e.section         != '' THEN e.section
+                    WHEN e.sub_division    IS NOT NULL AND e.sub_division    != '' THEN e.sub_division
+                    WHEN e.division        IS NOT NULL AND e.division        != '' THEN e.division
+                    WHEN e.factory         IS NOT NULL AND e.factory         != '' THEN e.factory
+                    WHEN e.company         IS NOT NULL AND e.company         != '' THEN e.company
+                    WHEN e.corporation     IS NOT NULL AND e.corporation     != '' THEN e.corporation
                     ELSE NULL
                 END AS department_name
 
@@ -482,22 +389,127 @@ def get_employees_by_department(unit_id):
             JOIN descendants d ON e.organization_unit_id = d.id
             LEFT JOIN `{DB_SCHEMA}`.mbo_sessions ms
                 ON e.id = ms.employee_id AND ms.mbo_year = %s
-        ) t
+        )
+
+        /* Lớp 2: chọn điểm theo status + tính computed_final */
+        , prepared AS (
+            SELECT
+                b.*,
+
+                /* job_score theo status */
+                CASE
+                  WHEN b.status = 'reviewed_final' THEN b.job_score_reviewed
+                  WHEN b.status = 'approved_final' THEN b.job_score_approved
+                  ELSE 0
+                END AS job_score,
+
+                /* competency_score theo status */
+                CASE
+                  WHEN b.status = 'reviewed_final' THEN b.competency_score_reviewed
+                  WHEN b.status = 'approved_final' THEN b.competency_score_approved
+                  ELSE 0
+                END AS competency_score,
+
+                /* attitude_score theo status (2 trạng thái dùng chung thái độ năm) */
+                CASE
+                  WHEN b.status IN ('reviewed_final','approved_final') THEN b.attitude_score_year
+                  ELSE 0
+                END AS attitude_score,
+
+                /* computed_final theo position + status (các trạng thái khác = 0) */
+                CASE
+                  WHEN b.status NOT IN ('reviewed_final','approved_final') THEN 0
+                  ELSE
+                    CASE
+                      /* TL/Trưởng nhóm/Phó nhóm */
+                      WHEN  LOWER(b.position) REGEXP 'trưởng[[:space:]]*nhóm|truong[[:space:]]*nhom|phó[[:space:]]*nhóm|pho[[:space:]]*nhom|team[[:space:]]*lead'
+                         OR  CONCAT(' ', LOWER(b.position), ' ') LIKE '% tl %'
+                      THEN ROUND(
+                           0.10 * b.attitude_score_year
+                         + 0.45 * (CASE WHEN b.status='reviewed_final' THEN b.job_score_reviewed        ELSE b.job_score_approved        END)
+                         + 0.45 * (CASE WHEN b.status='reviewed_final' THEN b.competency_score_reviewed ELSE b.competency_score_approved END)
+                      , 2)
+
+                      /* Nhân viên */
+                      WHEN  LOWER(b.position) REGEXP 'nhân[[:space:]]*viên|nhan[[:space:]]*vien|staff|employee'
+                      THEN ROUND(
+                           0.20 * b.attitude_score_year
+                         + 0.40 * (CASE WHEN b.status='reviewed_final' THEN b.job_score_reviewed        ELSE b.job_score_approved        END)
+                         + 0.40 * (CASE WHEN b.status='reviewed_final' THEN b.competency_score_reviewed ELSE b.competency_score_approved END)
+                      , 2)
+
+                      /* Cấp khác: bỏ thái độ */
+                      ELSE ROUND(
+                           0.50 * (CASE WHEN b.status='reviewed_final' THEN b.job_score_reviewed        ELSE b.job_score_approved        END)
+                         + 0.50 * (CASE WHEN b.status='reviewed_final' THEN b.competency_score_reviewed ELSE b.competency_score_approved END)
+                      , 2)
+                    END
+                END AS computed_final
+            FROM base b
+        )
+
+        /* Lớp 3: xuất dữ liệu cuối cùng + score_final theo yêu cầu */
+        SELECT
+            p.id,
+            p.full_name,
+            p.employee_code,
+            p.position,
+            p.phone,
+            p.entry_date,
+            p.birth_date,
+            p.gender,
+            p.note,
+            p.corporation,
+            p.company,
+            p.factory,
+            p.division,
+            p.sub_division,
+            p.section,
+            p.group_name,
+            p.organization_unit_id,
+
+            p.status,
+            p.reviewer_id,
+            p.approver_id,
+
+            p.job_score,
+            p.competency_score,
+            p.attitude_score,
+            p.attitude_status,
+
+            p.computed_final,
+
+            /* score_final: chỉ cho reviewed/approved; ưu tiên ms_score_final nếu có */
+            CASE
+              WHEN p.ms_score_final IS NOT NULL THEN ROUND(p.ms_score_final, 2)
+              WHEN p.status IN ('reviewed_final','approved_final') THEN p.computed_final
+              ELSE 0
+            END AS score_final,
+
+            p.department_name
+        FROM prepared p
     """
 
     try:
-        # Thứ tự tham số: unit_id, rồi 10 lần mbo_year tương ứng các subquery ở trên
-        cursor.execute(query, (unit_id,
-                               mbo_year, mbo_year, mbo_year,  # job/comp/att in outer simple fields
-                               mbo_year, mbo_year, mbo_year,  # computed (lead) a2/p2/c2
-                               mbo_year, mbo_year, mbo_year,  # computed (staff) a3/p3/c3
-                               mbo_year, mbo_year,            # computed (others) p4/c4
-                               mbo_year))                     # join mbo_sessions
+        # placeholders: unit_id + 5×mbo_year (job_r, job_a, comp_r, comp_a, attitude) + 1×mbo_year (join ms)
+        cursor.execute(
+            query,
+            (
+                unit_id,
+                mbo_year,  # job_score_reviewed
+                mbo_year,  # job_score_approved
+                mbo_year,  # competency_score_reviewed
+                mbo_year,  # competency_score_approved
+                mbo_year,  # attitude_score_year
+                mbo_year,  # join mbo_sessions
+            ),
+        )
         rows = cursor.fetchall()
         return jsonify(rows)
     finally:
         cursor.close()
         conn.close()
+
 
 
 @employees_bp.route("/accessible-units", methods=["GET"])
@@ -564,6 +576,87 @@ def get_all_sub_unit_ids(start_ids, cursor):
         all_ids.update(children)
 
     return list(all_ids)
+
+@employees_bp.route("/accessible-units-v2", methods=["GET"])
+def get_accessible_organization_units_v2():
+    """
+    Trả về tập unit người dùng có thể thấy:
+    - Nếu có quyền 'view_FY_review' => trả toàn bộ organization_units
+    - Ngược lại: UNION giữa tất cả CON (descendants, gồm chính nó)
+                 và tất cả CHA (ancestors, gồm chính nó) của X-Org-Unit-Id
+    Headers:
+      - X-Org-Unit-Id: id phòng ban đang quản lý
+      - X-Permissions: chuỗi quyền, ví dụ: "view_FY_review,edit_employee"
+    """
+    org_unit_id = request.headers.get("X-Org-Unit-Id")
+    permissions = request.headers.get("X-Permissions", "")
+
+    # Parse quyền
+    try:
+        permissions_list = [p.strip() for p in permissions.split(",") if p.strip()]
+    except Exception:
+        permissions_list = []
+
+    # Nếu có quyền cao nhất => trả toàn bộ
+    connection = get_connection()
+    try:
+        with connection.cursor(dictionary=True) as cursor:
+            if "view_FY_review" in permissions_list:
+                cursor.execute("""
+                    SELECT id, name, type, parent_id
+                    FROM organization_units
+                """)
+                return jsonify(cursor.fetchall())
+
+            # Không có quyền cao: cần org_unit_id hợp lệ
+            if not org_unit_id or org_unit_id == "null":
+                return jsonify([])
+
+            try:
+                managed_id = int(org_unit_id)
+            except ValueError:
+                return jsonify({"error": "Invalid organization unit ID"}), 400
+
+            # CTE đệ quy: lấy descendants và ancestors, rồi UNION DISTINCT
+            query = """
+                WITH RECURSIVE
+                desc_units AS (
+                    SELECT id, name, type, parent_id
+                    FROM organization_units
+                    WHERE id = %s
+                    UNION ALL
+                    SELECT ou.id, ou.name, ou.type, ou.parent_id
+                    FROM organization_units ou
+                    JOIN desc_units d ON ou.parent_id = d.id
+                ),
+                anc_units AS (
+                    SELECT id, name, type, parent_id
+                    FROM organization_units
+                    WHERE id = %s
+                    UNION ALL
+                    SELECT p.id, p.name, p.type, p.parent_id
+                    FROM organization_units p
+                    JOIN anc_units a ON a.parent_id = p.id
+                )
+                SELECT DISTINCT id, name, type, parent_id
+                FROM (
+                    SELECT * FROM desc_units
+                    UNION ALL
+                    SELECT * FROM anc_units
+                ) u
+                ORDER BY id;
+            """
+            cursor.execute(query, (managed_id, managed_id))
+            data = cursor.fetchall()
+            return jsonify(data)
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        try:
+            connection.close()
+        except Exception:
+            pass
 
 @employees_bp.route('/by-subordinates', methods=['POST'])
 def get_employees_for_allocation():

@@ -10,26 +10,26 @@ LEVEL_ORDER = [
 ]
 
 # -------------------------------
-# Helper: require mbo_year 2000..2100
+# Helper: require mbo_year từ request (2000..2100)
+# Ưu tiên: ?mbo_year= | body.json["mbo_year"] | Header: X-MBO-Year
 # -------------------------------
-def _require_mbo_year():
+def _require_mbo_year_from_request():
     try:
-        conn = get_connection()
-        cur = conn.cursor(dictionary=True)
-        cur.execute("SELECT current_year FROM nsh.mbo_settings LIMIT 1")
-        row = cur.fetchone()
-        cur.close()
-        conn.close()
+        # 1) Query string
+        val = request.args.get("mbo_year")
+        if val is None:
+            # 2) JSON body
+            data = request.get_json(silent=True) or {}
+            val = data.get("mbo_year")
+        if val is None:
+            # 3) Header
+            val = request.headers.get("X-MBO-Year")
 
-        if not row:
-            return None
-
-        mbo_year = int(row['current_year'])
-        if 2000 <= mbo_year <= 2100:
-            return mbo_year
+        year = int(val)
+        if 2000 <= year <= 2100:
+            return year
         return None
-    except Exception as e:
-        print("❌ _require_mbo_year error:", e)
+    except Exception:
         return None
 
 
@@ -41,7 +41,7 @@ def submit_mbo():
     if not employee_id:
         return jsonify({"error": "employee_id is required"}), 400
 
-    mbo_year = _require_mbo_year()
+    mbo_year = _require_mbo_year_from_request()
     if mbo_year is None:
         return jsonify({"error": "Thiếu hoặc sai định dạng mbo_year (2000..2100)"}), 400
 
@@ -244,7 +244,7 @@ def submit_mbo():
 # -------------------------------
 @submit_bp.route('/mbo/session-status/<int:employee_id>', methods=['GET'])
 def get_mbo_status(employee_id):
-    mbo_year = _require_mbo_year()
+    mbo_year = _require_mbo_year_from_request()
     if mbo_year is None:
         return jsonify({"status": "draft", "note": "Thiếu mbo_year"}), 400
 
@@ -271,7 +271,7 @@ def get_mbo_status(employee_id):
 @jwt_required()
 def check_mbo_permissions(employee_id):
     current_user_id = get_jwt_identity()
-    mbo_year = _require_mbo_year()
+    mbo_year = _require_mbo_year_from_request()
     if mbo_year is None:
         return jsonify({"error": "Thiếu hoặc sai định dạng mbo_year (2000..2100)"}), 400
 
@@ -314,7 +314,7 @@ def review_mbo():
     if not employee_id:
         return jsonify({"error": "Thiếu employee_id"}), 400
 
-    mbo_year = _require_mbo_year()
+    mbo_year = _require_mbo_year_from_request()
     if mbo_year is None:
         return jsonify({"error": "Thiếu hoặc sai định dạng mbo_year (2000..2100)"}), 400
 
@@ -352,7 +352,7 @@ def approve_mbo():
     if not employee_id:
         return jsonify({"error": "Thiếu employee_id"}), 400
 
-    mbo_year = _require_mbo_year()
+    mbo_year = _require_mbo_year_from_request()
     if mbo_year is None:
         return jsonify({"error": "Thiếu hoặc sai định dạng mbo_year (2000..2100)"}), 400
 
@@ -381,6 +381,8 @@ def approve_mbo():
             conn.close()
         except:
             pass
+
+
 # -------------------------------
 # Helper: tính reviewer/approver theo cây tổ chức
 # -------------------------------
@@ -451,8 +453,6 @@ def _calc_reviewer_approver(conn, emp_row):
 # -------------------------------
 # SUBMIT FINAL (tự đánh giá cuối năm)
 # -------------------------------
-
-# --- Đảm bảo _require_mbo_year đọc được query/body/header ---
 
 # --- Helpers cập nhật trạng thái FINAL ---
 def _update_mbo_status_final(conn, employee_id: int, mbo_year: int, new_status: str):
@@ -559,7 +559,7 @@ def submit_mbo_final():
     if not employee_id:
         return jsonify({"error": "employee_id is required"}), 400
 
-    mbo_year = _require_mbo_year()
+    mbo_year = _require_mbo_year_from_request()
     if mbo_year is None:
         return jsonify({"error": "Thiếu hoặc sai định dạng mbo_year (2000..2100)"}), 400
 
@@ -611,19 +611,6 @@ def submit_mbo_final():
 
         # (Không rơi vào Case 1/2) -> giữ submitted_final, KHÔNG động vào dữ liệu mục tiêu
 
-        # (Tuỳ chọn) Debug số lượng NULL để xác nhận không bị xóa ngoài ý muốn
-        # with conn.cursor(dictionary=True) as dbg:
-        #     dbg.execute("""
-        #       SELECT
-        #         SUM(reviewer_ti_trong IS NULL) r_ti_null,
-        #         SUM(approver_ti_trong IS NULL) a_ti_null,
-        #         SUM(reviewer_rating   IS NULL) r_ra_null,
-        #         SUM(approver_rating   IS NULL) a_ra_null
-        #       FROM PersonalMBO
-        #       WHERE employee_code=%s AND mbo_year=%s
-        #     """, (employee_code, mbo_year))
-        #     print("DEBUG PersonalMBO NULLs after helpers:", dbg.fetchone())
-
         conn.commit()
 
         return jsonify({
@@ -650,7 +637,7 @@ def reviewed_final_mbo():
     if not employee_id:
         return jsonify({"error": "Thiếu employee_id"}), 400
 
-    mbo_year = _require_mbo_year()
+    mbo_year = _require_mbo_year_from_request()
     if mbo_year is None:
         return jsonify({"error": "Thiếu hoặc sai định dạng mbo_year (2000..2100)"}), 400
 
@@ -676,7 +663,7 @@ def approved_final_mbo():
     if not employee_id:
         return jsonify({"error": "Thiếu employee_id"}), 400
 
-    mbo_year = _require_mbo_year()
+    mbo_year = _require_mbo_year_from_request()
     if mbo_year is None:
         return jsonify({"error": "Thiếu hoặc sai định dạng mbo_year (2000..2100)"}), 400
 
@@ -721,6 +708,3 @@ def _update_mbo_status(employee_id: int, mbo_year: int, new_status: str):
             conn.close()
         except:
             pass
-
-
-

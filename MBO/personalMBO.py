@@ -3,8 +3,14 @@ from database import get_connection
 
 employees_bpp = Blueprint('employees_bp', __name__, url_prefix='/employees')
 
-# --- helper: bắt buộc có năm 2000..2100, lấy từ body hoặc query (?year=) ---
+# ======================
+# Helpers chung
+# ======================
 def _require_mbo_year():
+    """
+    Lấy mbo_year từ body JSON hoặc querystring (?mbo_year=),
+    hợp lệ khi là số 2000..2100. Không hợp lệ -> None.
+    """
     year = None
     if request.is_json:
         year = (request.get_json(silent=True) or {}).get('mbo_year')
@@ -19,6 +25,99 @@ def _require_mbo_year():
     return year
 
 
+def _table_has_column(cursor, table, column):
+    """
+    Kiểm tra bảng trong DB hiện tại có cột hay không.
+    Lưu ý: dùng đúng tên bảng bạn đang sử dụng trong file này (PersonalMBO).
+    """
+    cursor.execute(
+        """
+        SELECT 1
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = %s
+          AND COLUMN_NAME = %s
+        LIMIT 1
+        """,
+        (table, column),
+    )
+    return cursor.fetchone() is not None
+
+
+def _has_receiver_goal_id(cursor):
+    cursor.execute("SHOW COLUMNS FROM mbo_allocations LIKE 'receiver_goal_id'")
+    return cursor.fetchone() is not None
+
+
+def _fetch_sender_goal(cursor, goal_id, sender_code, mbo_year):
+    """
+    Lấy record nguồn từ PersonalMBO theo id + employee_code (+mbo_year nếu có cột).
+    """
+    has_year = _table_has_column(cursor, "PersonalMBO", "mbo_year")
+    sql = f"""
+        SELECT id, employee_code{', mbo_year' if has_year else ''},
+               ten_muc_tieu, mo_ta, don_vi_do_luong,
+               gia_tri_ban_dau, muc_tieu, han_hoan_thanh,
+               created_at, updated_at
+        FROM PersonalMBO
+        WHERE id = %s AND employee_code = %s
+        {"AND mbo_year = %s" if has_year else ""}
+        LIMIT 1
+    """
+    params = [goal_id, sender_code]
+    if has_year:
+        params.append(mbo_year)
+    cursor.execute(sql, params)
+    return cursor.fetchone()
+
+
+def _guess_receiver_goal_id(cursor, sender_goal_row, receiver_code, mbo_year, expected_muc_tieu):
+    """
+    Dò id record đã copy cho người nhận khi mbo_allocations không có receiver_goal_id.
+    So khớp fingerprint của goal nguồn + allocation_value (muc_tieu bên người nhận).
+    - Nếu bảng có cột mbo_year => thêm điều kiện lọc năm
+    - Nếu bảng có cột phan_loai => ép phan_loai = 'nhan' (đánh dấu mục tiêu nhận)
+    """
+    has_year = _table_has_column(cursor, "PersonalMBO", "mbo_year")
+    has_phan_loai = _table_has_column(cursor, "PersonalMBO", "phan_loai")
+
+    year_cond = "AND mbo_year = %s" if has_year else ""
+    phanloai_cond = "AND phan_loai = 'nhan'" if has_phan_loai else ""
+
+    sql = f"""
+        SELECT id FROM PersonalMBO
+        WHERE employee_code = %s
+          {year_cond}
+          AND ten_muc_tieu = %s AND mo_ta = %s
+          AND don_vi_do_luong = %s
+          AND IFNULL(gia_tri_ban_dau,'') = IFNULL(%s,'')
+          AND IFNULL(han_hoan_thanh,'') = IFNULL(%s,'')
+          AND muc_tieu = %s
+          {phanloai_cond}
+        ORDER BY id DESC
+        LIMIT 1
+    """
+
+    params = [receiver_code]
+    if has_year:
+        params.append(mbo_year)
+    params += [
+        sender_goal_row.get("ten_muc_tieu"),
+        sender_goal_row.get("mo_ta"),
+        sender_goal_row.get("don_vi_do_luong"),
+        sender_goal_row.get("gia_tri_ban_dau"),
+        sender_goal_row.get("han_hoan_thanh"),
+        str(expected_muc_tieu),
+    ]
+
+    cursor.execute(sql, params)
+    row = cursor.fetchone()
+    return row["id"] if row else None
+
+
+# ======================
+# POST /employees/muctieu
+# ======================
 @employees_bpp.route('/muctieu', methods=['POST'])
 def create_muctieu():
     data = request.json or {}
@@ -26,6 +125,8 @@ def create_muctieu():
     if mbo_year is None:
         return jsonify({"error": "Thiếu hoặc sai định dạng mbo_year (2000..2100)"}), 400
 
+    db = None
+    cursor = None
     try:
         db = get_connection()
         cursor = db.cursor()
@@ -53,13 +154,20 @@ def create_muctieu():
         db.commit()
         return jsonify({"message": "Tạo mục tiêu thành công", "id": cursor.lastrowid, "mbo_year": mbo_year}), 201
     except Exception as e:
-        db.rollback()
+        if db:
+            db.rollback()
         return jsonify({"error": str(e)}), 500
     finally:
-        cursor.close()
-        db.close()
+        try:
+            if cursor: cursor.close()
+            if db: db.close()
+        except Exception:
+            pass
 
 
+# ======================
+# POST /employees/muctieu/by-employee
+# ======================
 @employees_bpp.route('/muctieu/by-employee', methods=['POST'])
 def get_muctieu_by_employee_post():
     data = request.json or {}
@@ -71,6 +179,8 @@ def get_muctieu_by_employee_post():
     if mbo_year is None:
         return jsonify({"error": "Thiếu hoặc sai định dạng mbo_year (2000..2100)"}), 400
 
+    db = None
+    cursor = None
     try:
         db = get_connection()
         cursor = db.cursor(dictionary=True)
@@ -119,17 +229,24 @@ def get_muctieu_by_employee_post():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
-        cursor.close()
-        db.close()
+        try:
+            if cursor: cursor.close()
+            if db: db.close()
+        except Exception:
+            pass
 
 
-
+# ======================
+# DELETE /employees/muctieu/<id>
+# ======================
 @employees_bpp.route('/muctieu/<int:muctieu_id>', methods=['DELETE'])
 def delete_muctieu(muctieu_id):
     mbo_year = _require_mbo_year()
     if mbo_year is None:
         return jsonify({"error": "Thiếu hoặc sai định dạng mbo_year (2000..2100)"}), 400
 
+    db = None
+    cursor = None
     try:
         db = get_connection()
         cursor = db.cursor()
@@ -144,18 +261,25 @@ def delete_muctieu(muctieu_id):
         return jsonify({"message": "Xoá mục tiêu thành công", "mbo_year": mbo_year}), 200
 
     except Exception as e:
-        db.rollback()
+        if db:
+            db.rollback()
         error_msg = str(e)
-        if "1451" in error_msg:
+        if "1451" in error_msg:  # foreign key constraint (đã phân bổ)
             return jsonify({
                 "error": "Không thể xoá mục tiêu vì đã được phân bổ cho nhân viên khác."
             }), 400
         return jsonify({"error": "Đã xảy ra lỗi hệ thống."}), 500
     finally:
-        cursor.close()
-        db.close()
+        try:
+            if cursor: cursor.close()
+            if db: db.close()
+        except Exception:
+            pass
 
 
+# ======================
+# PUT /employees/muctieu/<id>  (kèm propagate sang mục tiêu đã nhận phân bổ)
+# ======================
 @employees_bpp.route('/muctieu/<int:muctieu_id>', methods=['PUT'])
 def update_muctieu(muctieu_id):
     data = request.json or {}
@@ -163,32 +287,41 @@ def update_muctieu(muctieu_id):
     if mbo_year is None:
         return jsonify({"error": "Thiếu hoặc sai định dạng mbo_year (2000..2100)"}), 400
 
+    # Các trường cho phép cập nhật ở bản gốc (giữ như bạn đang dùng)
+    allowed_fields = [
+        'employee_code', 'ten_muc_tieu', 'mo_ta', 'don_vi_do_luong',
+        'ti_trong', 'gia_tri_ban_dau', 'muc_tieu', 'han_hoan_thanh',
+        'xep_loai', 'cap_do_theo_doi', 'phan_loai', 'phan_bo',
+        'reviewer_ti_trong', 'approver_ti_trong',
+        'reviewer_rating', 'approver_rating',
+        'self_ey_content', 'self_ey_result', 'self_ey_rating',
+        # Thêm các trường mới
+        'approved_ey_content', 'approved_ey_result', 'approved_ey_rating', 'approved_ey_score',
+        'reviewed_ey_content', 'reviewed_ey_result', 'reviewed_ey_rating', 'reviewed_ey_score'
+    ]
+
+    # Các trường được propagate sang mục tiêu đã copy của người nhận
+    propagate_fields_whitelist = {
+        'ten_muc_tieu', 'mo_ta', 'don_vi_do_luong', 'gia_tri_ban_dau', 'han_hoan_thanh'
+    }
+
+    db = None
+    cursor = None
     try:
         db = get_connection()
         cursor = db.cursor(dictionary=True)
 
-        # Kiểm tra mục tiêu đúng năm tồn tại
+        # 0) Lấy mục tiêu hiện tại (bản gốc) để có fingerprint trước khi sửa
         cursor.execute("SELECT * FROM PersonalMBO WHERE id = %s AND mbo_year = %s", (muctieu_id, mbo_year))
         current = cursor.fetchone()
         if not current:
             return jsonify({"error": "Không tìm thấy mục tiêu theo năm yêu cầu"}), 404
 
-        # Các trường cho phép cập nhật
-        # Các trường cho phép cập nhật
-        allowed_fields = [
-            'employee_code', 'ten_muc_tieu', 'mo_ta', 'don_vi_do_luong',
-            'ti_trong', 'gia_tri_ban_dau', 'muc_tieu', 'han_hoan_thanh',
-            'xep_loai', 'cap_do_theo_doi', 'phan_loai', 'phan_bo',
-            'reviewer_ti_trong', 'approver_ti_trong',
-            'reviewer_rating', 'approver_rating',
-            'self_ey_content', 'self_ey_result', 'self_ey_rating',
-            # Thêm các trường mới
-            'approved_ey_content', 'approved_ey_result', 'approved_ey_rating', 'approved_ey_score',
-            'reviewed_ey_content', 'reviewed_ey_result', 'reviewed_ey_rating', 'reviewed_ey_score'
-        ]
+        sender_code = current["employee_code"]
+
+        # 1) Chuẩn bị UPDATE cho bản gốc
         update_fields = []
         values = []
-
         for field in allowed_fields:
             if field in data:
                 update_fields.append(f"{field} = %s")
@@ -197,7 +330,6 @@ def update_muctieu(muctieu_id):
         if not update_fields:
             return jsonify({"error": "Không có trường nào để cập nhật"}), 400
 
-        # luôn chạm updated_at
         update_fields.append("updated_at = NOW()")
 
         sql = f"""
@@ -207,18 +339,108 @@ def update_muctieu(muctieu_id):
         """
         values.extend([muctieu_id, mbo_year])
 
+        # 2) Thực hiện update bản gốc
         cursor.execute(sql, values)
-        db.commit()
 
-        return jsonify({"message": "Cập nhật mục tiêu thành công", "mbo_year": mbo_year}), 200
+        # 3) Tính các trường cần propagate (chỉ các field mà client thực sự gửi và trong whitelist)
+        propagate_updates = {k: v for k, v in data.items() if k in propagate_fields_whitelist}
+
+        # Nếu không có gì để propagate -> commit & trả về
+        if not propagate_updates:
+            db.commit()
+            return jsonify({"message": "Cập nhật mục tiêu thành công", "mbo_year": mbo_year, "propagated": 0}), 200
+
+        # 4) Lấy danh sách phân bổ của mục tiêu này
+        cursor.execute(
+            """
+            SELECT a.id, a.receiver_code, a.allocation_value, a.receiver_goal_id
+            FROM mbo_allocations a
+            WHERE a.goal_id = %s
+              AND a.sender_code = %s
+              AND a.mbo_year = %s
+            """,
+            (muctieu_id, sender_code, mbo_year),
+        )
+        allocations = cursor.fetchall() or []
+
+        if not allocations:
+            db.commit()
+            return jsonify({"message": "Cập nhật mục tiêu thành công (không có phân bổ để đồng bộ)", "mbo_year": mbo_year, "propagated": 0}), 200
+
+        # 5) Dò schema và chuẩn bị fingerprint trước khi sửa (từ current)
+        has_receiver_goal = _has_receiver_goal_id(cursor)
+        sender_goal_before = {
+            "ten_muc_tieu": current.get("ten_muc_tieu"),
+            "mo_ta": current.get("mo_ta"),
+            "don_vi_do_luong": current.get("don_vi_do_luong"),
+            "gia_tri_ban_dau": current.get("gia_tri_ban_dau"),
+            "han_hoan_thanh": current.get("han_hoan_thanh"),
+        }
+
+        propagated_count = 0
+        for alloc in allocations:
+            receiver_goal_id = None
+
+            if has_receiver_goal and alloc.get("receiver_goal_id"):
+                receiver_goal_id = alloc["receiver_goal_id"]
+            else:
+                # Fallback: dò id bên PersonalMBO của người nhận dựa fingerprint + allocation_value (chính là muc_tieu)
+                receiver_goal_id = _guess_receiver_goal_id(
+                    cursor,
+                    sender_goal_before,
+                    alloc["receiver_code"],
+                    mbo_year,
+                    expected_muc_tieu=alloc["allocation_value"],
+                )
+                # Nếu tìm thấy và bảng có cột receiver_goal_id -> lưu bù để lần sau nhanh
+                if receiver_goal_id and has_receiver_goal:
+                    cursor.execute(
+                        "UPDATE mbo_allocations SET receiver_goal_id = %s WHERE id = %s",
+                        (receiver_goal_id, alloc["id"]),
+                    )
+
+            if not receiver_goal_id:
+                # Không tìm thấy record đã copy để cập nhật -> bỏ qua
+                continue
+
+            # Build câu UPDATE cho mục tiêu của người nhận: chỉ chạm các field propagate + updated_at
+            set_parts = [f"{k} = %s" for k in propagate_updates.keys()]
+            vals = list(propagate_updates.values())
+            set_parts.append("updated_at = NOW()")
+
+            upd_sql = f"""
+                UPDATE PersonalMBO
+                SET {', '.join(set_parts)}
+                WHERE id = %s
+            """
+            vals.append(receiver_goal_id)
+
+            cursor.execute(upd_sql, vals)
+            propagated_count += 1
+
+        db.commit()
+        return jsonify({
+            "message": "Cập nhật mục tiêu thành công và đã đồng bộ mục tiêu đã nhận phân bổ",
+            "mbo_year": mbo_year,
+            "propagated": propagated_count
+        }), 200
 
     except Exception as e:
-        db.rollback()
-        print("Lỗi cập nhật mục tiêu:", e)
+        if db:
+            db.rollback()
+        print("Lỗi cập nhật mục tiêu (propagate):", repr(e))
         return jsonify({"error": str(e)}), 500
     finally:
-        cursor.close()
-        db.close()
+        try:
+            if cursor: cursor.close()
+            if db: db.close()
+        except Exception:
+            pass
+
+
+# ======================
+# POST /employees/muctieu/by-department
+# ======================
 @employees_bpp.route('/muctieu/by-department', methods=['POST'])
 def get_muctieu_by_department():
     data = request.json or {}
@@ -235,22 +457,14 @@ def get_muctieu_by_department():
     if mbo_year is None:
         return jsonify({"error": "Thiếu hoặc sai định dạng mbo_year (2000..2100)"}), 400
 
+    db = None
+    cursor = None
     try:
         db = get_connection()
         cursor = db.cursor(dictionary=True)
 
-        # Lấy tất cả phòng ban con (bao gồm chính nó) bằng CTE đệ quy (MySQL 8+)
-        # Nếu DB chưa bật recursive CTE, mình có thể viết phiên bản vòng lặp Python—bạn bảo mình nếu cần.
+        # ✅ Bỏ đệ quy — chỉ lấy đúng cấp phòng ban này
         sql = """
-        WITH RECURSIVE ou_all AS (
-            SELECT id, parent_id, name, type
-            FROM organization_units
-            WHERE id = %s
-            UNION ALL
-            SELECT ou.id, ou.parent_id, ou.name, ou.type
-            FROM organization_units ou
-            INNER JOIN ou_all a ON ou.parent_id = a.id
-        )
         SELECT
             p.id,
             p.employee_code,
@@ -283,28 +497,32 @@ def get_muctieu_by_department():
             p.created_at,
             p.updated_at,
 
-            -- Thông tin nhân viên/phòng ban để hiển thị
+            -- Thông tin nhân viên/phòng ban
             e.full_name,
             e.position,
             e.organization_unit_id,
-            ou_all.name AS department_name,
-            ou_all.type AS department_type
+            ou.name AS department_name,
+            ou.type AS department_type
         FROM PersonalMBO p
         INNER JOIN employees2026 e
             ON e.employee_code = p.employee_code
-        INNER JOIN ou_all
-            ON ou_all.id = e.organization_unit_id
+        INNER JOIN organization_units ou
+            ON ou.id = e.organization_unit_id
         WHERE p.mbo_year = %s
-          AND LOWER(COALESCE(p.cap_do_theo_doi, '')) = 'phongban'
-        ORDER BY ou_all.id, e.full_name, p.han_hoan_thanh ASC
+          AND e.organization_unit_id = %s
+          AND (
+                LOWER(COALESCE(p.cap_do_theo_doi, '')) = 'phongban'
+             OR LOWER(COALESCE(p.cap_do_theo_doi, '')) = 'congty'
+          )
+        ORDER BY e.full_name, p.han_hoan_thanh ASC
         """
-        cursor.execute(sql, (org_unit_id, mbo_year))
+        cursor.execute(sql, (mbo_year, org_unit_id))
         rows = cursor.fetchall()
 
         return jsonify({
             "data": rows,
             "mbo_year": mbo_year,
-            "root_organization_unit_id": org_unit_id,
+            "organization_unit_id": org_unit_id,
             "count": len(rows)
         }), 200
 
@@ -312,279 +530,7 @@ def get_muctieu_by_department():
         return jsonify({"error": str(e)}), 500
     finally:
         try:
-            cursor.close()
-            db.close()
-        except Exception:
-            pass
-@employees_bpp.route('/muctieu/by-company-auto', methods=['POST'])
-def get_muctieu_by_company_auto():
-    """
-    Body JSON:
-    {
-      "organization_unit_id": 123,
-      "mbo_year": 2025
-    }
-    """
-    data = request.json or {}
-    orig_id = data.get('organization_unit_id') or data.get('department_id') or data.get('company_id')
-    if orig_id is None:
-        return jsonify({"error": "Thiếu organization_unit_id"}), 400
-
-    try:
-        orig_id = int(orig_id)
-    except (TypeError, ValueError):
-        return jsonify({"error": "organization_unit_id không hợp lệ"}), 400
-
-    mbo_year = _require_mbo_year()
-    if mbo_year is None:
-        return jsonify({"error": "Thiếu hoặc sai định dạng mbo_year (2000..2100)"}), 400
-
-    try:
-        db = get_connection()
-        cursor = db.cursor(dictionary=True)
-
-        # === B1. Lấy node gốc và loại ===
-        cursor.execute("""
-            SELECT id, parent_id, name, LOWER(COALESCE(type,'')) AS type
-            FROM organization_units WHERE id=%s
-        """, (orig_id,))
-        orig = cursor.fetchone()
-        if not orig:
-            return jsonify({"error": "organization_unit_id không tồn tại"}), 404
-
-        orig_type = orig["type"]
-
-        # Tìm corporation ancestor cao nhất của orig_id (dùng cho cả 2 trường hợp)
-        cursor.execute("""
-            WITH RECURSIVE up AS (
-              SELECT id, parent_id, name, LOWER(COALESCE(type,'')) AS type, 0 depth
-              FROM organization_units WHERE id=%s
-              UNION ALL
-              SELECT p.id, p.parent_id, p.name, LOWER(COALESCE(p.type,'')) AS type, up.depth+1
-              FROM organization_units p JOIN up ON p.id = up.parent_id
-            )
-            SELECT id, name FROM up
-            WHERE type='corporation'
-            ORDER BY depth ASC LIMIT 1
-        """, (orig_id,))
-        corp_ancestor = cursor.fetchone()
-        if not corp_ancestor:
-            return jsonify({"error": "Không tìm thấy corporation tổ tiên"}), 404
-
-        # === B2. Hai trường hợp ghi nhớ ID ===
-
-        # Trường hợp 1: orig là corporation
-        if orig_type == 'corporation':
-            corp_id = orig["id"]
-            corp_name = orig["name"]
-
-            # Lấy tất cả company con (mọi cấp) của corporation này
-            cursor.execute("""
-                WITH RECURSIVE tree AS (
-                  SELECT id, parent_id, name, LOWER(COALESCE(type,'')) AS type
-                  FROM organization_units WHERE id=%s
-                  UNION ALL
-                  SELECT ou.id, ou.parent_id, ou.name, LOWER(COALESCE(ou.type,'')) AS type
-                  FROM organization_units ou
-                  JOIN tree t ON ou.parent_id = t.id
-                )
-                SELECT id, name FROM tree WHERE type='company'
-            """, (corp_id,))
-            company_rows = cursor.fetchall()
-            company_ids = [r["id"] for r in company_rows]  # có thể rỗng nếu chưa có company con
-
-            # Quét mục tiêu: chỉ canhan + congty + đúng năm + thuộc corporation này (self hoặc company con)
-            cursor.execute("""
-                WITH RECURSIVE
-                chain AS (
-                  SELECT id, parent_id, name, LOWER(COALESCE(type,'')) AS type, id AS start_id, 0 AS depth
-                  FROM organization_units
-                  UNION ALL
-                  SELECT p.id, p.parent_id, p.name, LOWER(COALESCE(p.type,'')) AS type, c.start_id, c.depth+1
-                  FROM organization_units p
-                  JOIN chain c ON p.id = c.parent_id
-                ),
-                nearest_company AS (
-                  SELECT start_id AS unit_id, id AS company_id, name AS company_name
-                  FROM (
-                    SELECT c.*, ROW_NUMBER() OVER (PARTITION BY start_id ORDER BY depth) rn
-                    FROM chain c WHERE c.type='company'
-                  ) t WHERE rn=1
-                ),
-                nearest_corporation AS (
-                  SELECT start_id AS unit_id, id AS corp_id, name AS corp_name
-                  FROM (
-                    SELECT c.*, ROW_NUMBER() OVER (PARTITION BY start_id ORDER BY depth) rn
-                    FROM chain c WHERE c.type='corporation'
-                  ) t WHERE rn=1
-                )
-                SELECT
-                  p.*,
-                  e.full_name, e.position,
-                  e.organization_unit_id AS employee_department_id,
-                  ou.name AS employee_department_name,
-                  LOWER(COALESCE(ou.type,'')) AS employee_department_type,
-                  nc.company_id   AS nearest_company_id,
-                  nc.company_name AS nearest_company_name,
-                  nco.corp_id     AS nearest_corp_id,
-                  nco.corp_name   AS nearest_corp_name
-                FROM PersonalMBO p
-                JOIN employees2026 e ON e.employee_code = p.employee_code
-                JOIN organization_units ou ON ou.id = e.organization_unit_id
-                LEFT JOIN nearest_company nc ON nc.unit_id = e.organization_unit_id
-                LEFT JOIN nearest_corporation nco ON nco.unit_id = e.organization_unit_id
-                WHERE p.mbo_year = %s
-                  AND LOWER(COALESCE(p.phan_loai,''))='canhan'
-                  AND LOWER(COALESCE(p.cap_do_theo_doi,''))='congty'
-                  AND nco.corp_id = %s  -- chỉ các mục tiêu thuộc tập đoàn này
-            """, (mbo_year, corp_id))
-            all_rows = cursor.fetchall()
-
-            # Chia nhóm: corporation self (nearest_company_id IS NULL) & từng company con
-            corp_rows = [r for r in all_rows if (r["nearest_corp_id"] == corp_id and r["nearest_company_id"] is None)]
-
-            by_company = {}
-            for r in all_rows:
-                cid = r["nearest_company_id"]
-                if cid is None:
-                    continue  # đã thuộc nhóm corporation self
-                # Chỉ giữ company là con của corp này (an toàn nếu DB có dữ liệu chéo)
-                if company_ids and cid not in company_ids:
-                    continue
-                cname = r["nearest_company_name"]
-                by_company.setdefault((cid, cname), []).append(r)
-
-            # Lọc bỏ company không có mục tiêu (count=0)
-            companies_payload = [
-                {
-                    "id": cid,
-                    "name": cname,
-                    "type": "company",
-                    "count": len(items),
-                    "data": items
-                }
-                for (cid, cname), items in by_company.items()
-                if len(items) > 0
-            ]
-
-            payload = {
-                "mbo_year": mbo_year,
-                "corporation": {
-                    "id": corp_id,
-                    "name": corp_name,
-                    "type": "corporation",
-                    "count": len(corp_rows),
-                    "data": corp_rows
-                },
-                "companies": companies_payload  # đã lọc bỏ company rỗng
-            }
-            return jsonify(payload), 200
-
-        # Trường hợp 2: orig KHÔNG phải corporation → lấy company gần nhất & corporation tương ứng
-        else:
-            # nearest company của orig_id
-            cursor.execute("""
-                WITH RECURSIVE up AS (
-                  SELECT id, parent_id, name, LOWER(COALESCE(type,'')) AS type, 0 depth
-                  FROM organization_units WHERE id=%s
-                  UNION ALL
-                  SELECT p.id, p.parent_id, p.name, LOWER(COALESCE(p.type,'')) AS type, up.depth+1
-                  FROM organization_units p JOIN up ON p.id = up.parent_id
-                )
-                SELECT id, name FROM up
-                WHERE type='company'
-                ORDER BY depth ASC LIMIT 1
-            """, (orig_id,))
-            company_ancestor = cursor.fetchone()
-            if not company_ancestor:
-                return jsonify({"error": "Không tìm thấy company ancestor gần nhất"}), 404
-
-            company_id, company_name = company_ancestor["id"], company_ancestor["name"]
-            corp_id, corp_name = corp_ancestor["id"], corp_ancestor["name"]
-
-            # Quét mục tiêu: canhan + congty + năm; chọn theo:
-            # - Company block: nearest_company_id = company_id
-            # - Corporation self block: nearest_corp_id = corp_id AND nearest_company_id IS NULL
-            cursor.execute("""
-                WITH RECURSIVE
-                chain AS (
-                  SELECT id, parent_id, name, LOWER(COALESCE(type,'')) AS type, id AS start_id, 0 AS depth
-                  FROM organization_units
-                  UNION ALL
-                  SELECT p.id, p.parent_id, p.name, LOWER(COALESCE(p.type,'')) AS type, c.start_id, c.depth+1
-                  FROM organization_units p
-                  JOIN chain c ON p.id = c.parent_id
-                ),
-                nearest_company AS (
-                  SELECT start_id AS unit_id, id AS company_id, name AS company_name
-                  FROM (
-                    SELECT c.*, ROW_NUMBER() OVER (PARTITION BY start_id ORDER BY depth) rn
-                    FROM chain c WHERE c.type='company'
-                  ) t WHERE rn=1
-                ),
-                nearest_corporation AS (
-                  SELECT start_id AS unit_id, id AS corp_id, name AS corp_name
-                  FROM (
-                    SELECT c.*, ROW_NUMBER() OVER (PARTITION BY start_id ORDER BY depth) rn
-                    FROM chain c WHERE c.type='corporation'
-                  ) t WHERE rn=1
-                )
-                SELECT
-                  p.*,
-                  e.full_name, e.position,
-                  e.organization_unit_id AS employee_department_id,
-                  ou.name AS employee_department_name,
-                  LOWER(COALESCE(ou.type,'')) AS employee_department_type,
-                  nc.company_id   AS nearest_company_id,
-                  nc.company_name AS nearest_company_name,
-                  nco.corp_id     AS nearest_corp_id,
-                  nco.corp_name   AS nearest_corp_name
-                FROM PersonalMBO p
-                JOIN employees2026 e ON e.employee_code = p.employee_code
-                JOIN organization_units ou ON ou.id = e.organization_unit_id
-                LEFT JOIN nearest_company nc ON nc.unit_id = e.organization_unit_id
-                LEFT JOIN nearest_corporation nco ON nco.unit_id = e.organization_unit_id
-                WHERE p.mbo_year = %s
-                  AND LOWER(COALESCE(p.phan_loai,''))='canhan'
-                  AND LOWER(COALESCE(p.cap_do_theo_doi,''))='congty'
-                  AND (
-                       (nc.company_id = %s) -- company block
-                    OR (nco.corp_id = %s AND nc.company_id IS NULL) -- corporation self block
-                  )
-            """, (mbo_year, company_id, corp_id))
-            rows = cursor.fetchall()
-
-            # Chia 2 block
-            company_rows = [r for r in rows if r["nearest_company_id"] == company_id]
-            corp_rows    = [r for r in rows if (r["nearest_corp_id"] == corp_id and r["nearest_company_id"] is None)]
-
-            # Nếu company không có mục tiêu → không trả block company
-            payload = {
-                "mbo_year": mbo_year,
-                "corporation": {
-                    "id": corp_id,
-                    "name": corp_name,
-                    "type": "corporation",
-                    "count": len(corp_rows),
-                    "data": corp_rows
-                }
-            }
-            if len(company_rows) > 0:
-                payload["company"] = {
-                    "id": company_id,
-                    "name": company_name,
-                    "type": "company",
-                    "count": len(company_rows),
-                    "data": company_rows
-                }
-
-            return jsonify(payload), 200
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    finally:
-        try:
-            cursor.close()
-            db.close()
+            if cursor: cursor.close()
+            if db: db.close()
         except Exception:
             pass
