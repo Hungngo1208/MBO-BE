@@ -18,6 +18,12 @@ os.makedirs(COVER_DIR, exist_ok=True)
 ALLOWED_IMAGE = {"png", "jpg", "jpeg", "gif", "webp"}
 ALLOWED_VIDEO = {"mp4", "mov", "avi", "mkv", "webm"}
 
+# ========== Giá trị mặc định cho mapping ==========
+DEFAULT_STATUS = "fail"  # giữ nguyên theo code hiện tại
+DEFAULT_TRAINING_TYPE = "Đào tạo lần đầu"
+DEFAULT_HIEN_TRANG = "Chưa đào tạo"
+DEFAULT_GAN_NHAT = "Chưa đào tạo"
+DEFAULT_STATUS_WATCH = "fail"  # thêm mới: chỉ nhận 'fail' hoặc 'pass' (DB có CHECK)
 
 def _ext_ok(filename, allow_set):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in allow_set
@@ -271,12 +277,27 @@ def update_eln(item_id):
 
         # Thêm mapping mới cho nhân viên target chưa có
         if to_insert:
+            # thêm status, training_type, status_watch với giá trị mặc định
             ins_sql = """
                 INSERT INTO nsh.eln_employee_courses
-                    (employee_id, course_id, gan_nhat, ngay, ket_qua, hien_trang, thoi_gian_yeu_cau)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    (employee_id, course_id, gan_nhat, ngay, ket_qua, hien_trang, thoi_gian_yeu_cau, status, training_type, status_watch)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """
-            values = [(eid, item_id, "Chưa đào tạo", None, None, None, None) for eid in to_insert]
+            values = [
+                (
+                    eid,                 # employee_id
+                    item_id,             # course_id
+                    DEFAULT_GAN_NHAT,    # gan_nhat
+                    None,                # ngay
+                    None,                # ket_qua
+                    DEFAULT_HIEN_TRANG,  # hien_trang
+                    None,                # thoi_gian_yeu_cau
+                    DEFAULT_STATUS,      # status
+                    DEFAULT_TRAINING_TYPE,  # training_type
+                    DEFAULT_STATUS_WATCH    # status_watch (fail)
+                )
+                for eid in to_insert
+            ]
             cur6 = conn.cursor()
             cur6.executemany(ins_sql, values)
             cur6.close()
@@ -437,10 +458,11 @@ def create_eln():
 
         # 3) Bulk insert vào nsh.eln_employee_courses
         if employees:
+            # thêm status, training_type, status_watch với giá trị mặc định
             ins_sql = """
                 INSERT INTO nsh.eln_employee_courses
-                    (employee_id, course_id, gan_nhat, ngay, ket_qua, hien_trang, thoi_gian_yeu_cau)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    (employee_id, course_id, gan_nhat, ngay, ket_qua, hien_trang, thoi_gian_yeu_cau, status, training_type, status_watch)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """
             values = []
             emp_ids = []
@@ -448,13 +470,16 @@ def create_eln():
                 eid = e["employee_id"]
                 emp_ids.append(eid)
                 values.append((
-                    eid,            # employee_id
-                    new_id,         # course_id
-                    "Chưa đào tạo", # gan_nhat
-                    None,           # ngay
-                    None,           # ket_qua
-                    "Chưa đào tạo", # <-- cập nhật yêu cầu: hien_trang mặc định "Chưa đào tạo"
-                    None,           # thoi_gian_yeu_cau
+                    eid,                 # employee_id
+                    new_id,              # course_id
+                    DEFAULT_GAN_NHAT,    # gan_nhat
+                    None,                # ngay
+                    None,                # ket_qua
+                    DEFAULT_HIEN_TRANG,  # hien_trang
+                    None,                # thoi_gian_yeu_cau
+                    DEFAULT_STATUS,      # status
+                    DEFAULT_TRAINING_TYPE,  # training_type
+                    DEFAULT_STATUS_WATCH    # status_watch (fail)
                 ))
             cur3 = conn.cursor()
             cur3.executemany(ins_sql, values)
@@ -510,6 +535,7 @@ def create_eln():
 
     conn.close()
     return jsonify({"id": new_id, "linked_employees": len(employees) if employees else 0}), 201
+
 
 # DELETE /eln/<id> -> xoá
 @eln_bp.route("/eln/<int:item_id>", methods=["DELETE"])

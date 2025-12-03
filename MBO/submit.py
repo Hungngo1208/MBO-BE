@@ -55,61 +55,108 @@ def submit_mbo():
             return jsonify({"error": "employee not found"}), 404
 
         employee_code = emp['employee_code']
+        leaf_unit_id = emp.get('organization_unit_id')
 
-        # 2) Xác định cấp cao nhất có giá trị (không cần DB)
-        highest_level = None
-        for level in reversed(LEVEL_ORDER):
-            if emp.get(level):
-                highest_level = level
-                break
+        # ===== Helpers: truy đơn vị và leo lên cha =====
+        def get_unit_by_id(uid):
+            if not uid:
+                return None
+            with conn.cursor(dictionary=True, buffered=True) as cur:
+                cur.execute("""
+                    SELECT id, name, type, parent_id, employee_id
+                    FROM organization_units
+                    WHERE id = %s
+                """, (uid,))
+                return cur.fetchone()
 
-        # 3) Kiểm tra có phải quản lý cấp cao nhất không (buffered)
-        with conn.cursor(dictionary=True, buffered=True) as cur:
-            cur.execute("""
-                SELECT * FROM organization_units
-                WHERE type = %s AND name = %s AND employee_id = %s
-            """, (highest_level, emp[highest_level] if highest_level else None, employee_id))
-            is_top_manager = cur.fetchone()
+        def climb_chain_from(start_unit_id, max_depth=64):
+            """Trả về list [leaf, ..., root]. Có chống vòng lặp."""
+            chain, seen, u = [], set(), get_unit_by_id(start_unit_id)
+            while u and u['id'] not in seen and len(chain) < max_depth:
+                chain.append(u)
+                seen.add(u['id'])
+                if not u.get('parent_id'):
+                    break
+                u = get_unit_by_id(u['parent_id'])
+            return chain  # chain[0] = leaf
 
-        if is_top_manager:
-            reviewer_id = employee_id
-            approver_id = employee_id
-        else:
-            # 4) Tìm reviewer (buffered mỗi lần)
-            reviewer_unit = None
-            for level in LEVEL_ORDER[1:]:
-                unit_name = emp.get(level)
-                if unit_name:
-                    with conn.cursor(dictionary=True, buffered=True) as cur:
-                        cur.execute(
-                            "SELECT * FROM organization_units WHERE type = %s AND name = %s",
-                            (level, unit_name)
-                        )
-                        unit = cur.fetchone()
-                    if unit and unit.get('employee_id') and unit['employee_id'] != employee_id:
-                        reviewer_unit = unit
-                        break
+        # ===== Tìm reviewer/approver theo rule mới (bỏ LEVEL_ORDER) =====
+        reviewer_id = employee_id
+        approver_id = employee_id
+        reviewer_unit = None
+
+        if leaf_unit_id:
+            path = climb_chain_from(leaf_unit_id)  # từ đơn vị NV -> đỉnh
+
+            # --- Reviewer:
+            # manager của đơn vị hiện tại nếu khác NV; nếu trùng -> leo lên tới tổ tiên đầu tiên có manager khác NV
+            if path:
+                cur_unit = path[0]
+                if cur_unit.get('employee_id') and cur_unit['employee_id'] != employee_id:
+                    reviewer_unit = cur_unit
+                else:
+                    for u in path[1:]:
+                        if u.get('employee_id') and u['employee_id'] != employee_id:
+                            reviewer_unit = u
+                            break
             reviewer_id = reviewer_unit['employee_id'] if reviewer_unit else employee_id
 
-            # 5) Tìm approver
-            approver_id = None
-            reviewer_level_index = LEVEL_ORDER.index(reviewer_unit['type']) if reviewer_unit else -1
-            for i in range(reviewer_level_index + 1, len(LEVEL_ORDER)):
-                upper_level = LEVEL_ORDER[i]
-                upper_name = emp.get(upper_level)
-                if upper_name:
-                    with conn.cursor(dictionary=True, buffered=True) as cur:
-                        cur.execute(
-                            "SELECT * FROM organization_units WHERE type = %s AND name = %s",
-                            (upper_level, upper_name)
-                        )
-                        unit = cur.fetchone()
-                    if unit and unit.get('employee_id') and unit['employee_id'] != employee_id:
-                        approver_id = unit['employee_id']
-                        break
+            # --- Approver (cấp NGAY TRÊN reviewer):
+            approver_unit = None
+            if reviewer_unit:
+                # Tìm vị trí reviewer trong path [leaf,...,root]
+                try:
+                    idx = next(i for i, u in enumerate(path) if u['id'] == reviewer_unit['id'])
+                except StopIteration:
+                    idx = -1
 
-            if not approver_id:
-                approver_id = reviewer_id
+                if idx >= 0 and idx + 1 < len(path):
+                    upper = path[idx + 1]
+                    upper_mid = upper.get('employee_id')
+
+                    if upper_mid:
+                        if upper_mid == reviewer_id:
+                            # Cấp trên trực tiếp vẫn là reviewer -> approver = reviewer, KHÔNG leo tiếp
+                            approver_unit = upper  # chỉ để tham chiếu nếu cần
+                            approver_id = reviewer_id
+                        elif upper_mid != employee_id:
+                            # Cấp trên trực tiếp có manager khác reviewer & khác nhân viên -> lấy luôn
+                            approver_unit = upper
+                            approver_id = upper_mid
+                        else:
+                            # Cấp trên trực tiếp do chính nhân viên quản lý (hiếm) -> leo tiếp
+                            for u in path[idx+2:]:
+                                mid = u.get('employee_id')
+                                if mid and mid != employee_id and mid != reviewer_id:
+                                    approver_unit = u
+                                    approver_id = mid
+                                    break
+                            if not approver_unit:
+                                approver_id = reviewer_id
+                    else:
+                        # Cấp trên trực tiếp không có manager -> leo tiếp tới manager đầu tiên
+                        for u in path[idx+2:]:
+                            mid = u.get('employee_id')
+                            if mid and mid != employee_id and mid != reviewer_id:
+                                approver_unit = u
+                                approver_id = mid
+                                break
+                        if not approver_unit:
+                            approver_id = reviewer_id
+                else:
+                    # reviewer ở đỉnh cây -> approver = reviewer
+                    approver_id = reviewer_id
+            else:
+                # reviewer là chính NV -> tìm tổ tiên đầu tiên có manager hợp lệ
+                for u in path[1:]:
+                    mid = u.get('employee_id')
+                    if mid and mid != employee_id:
+                        approver_unit = u
+                        approver_id = mid
+                        break
+                if not approver_unit:
+                    approver_id = reviewer_id
+        # Nếu không có organization_unit_id: giữ mặc định self/self
 
         # 6) Upsert vào bảng mbo_sessions
         with conn.cursor() as c:
