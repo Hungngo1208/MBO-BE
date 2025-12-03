@@ -2,6 +2,7 @@
 from flask import Blueprint, request, jsonify
 from database import get_connection
 from decimal import Decimal
+from typing import List, Dict, Optional  # <<< thêm dòng này
 
 attitude_bp = Blueprint("attitude", __name__)
 
@@ -13,7 +14,7 @@ CUR_ITEMS = (
     "Chấp hành kỷ luật",
 )
 
-def _require_params(params: dict, required_keys: list[str]):
+def _require_params(params: Dict, required_keys: List[str]) -> Optional[str]:
     missing = [k for k in required_keys if params.get(k) in (None, "")]
     if missing:
         return f"Thiếu tham số: {', '.join(missing)}"
@@ -22,7 +23,7 @@ def _require_params(params: dict, required_keys: list[str]):
 def _normalize_title(s: str) -> str:
     return " ".join((s or "").strip().split())
 
-def _jsonify_row(row: dict) -> dict:
+def _jsonify_row(row: Dict) -> Dict:
     if not row:
         return row
     out = {}
@@ -35,7 +36,7 @@ def _jsonify_row(row: dict) -> dict:
             out[k] = v
     return out
 
-def _jsonify_rows(rows: list[dict]) -> list[dict]:
+def _jsonify_rows(rows: List[Dict]) -> List[Dict]:
     return [_jsonify_row(r) for r in rows]
 
 def _get_employee_id(cur, employee_code: str):
