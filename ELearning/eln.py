@@ -8,10 +8,19 @@ from database import get_connection
 
 eln_bp = Blueprint("eln", __name__)
 
-# ========== Cấu hình thư mục lưu file ==========
-BASE_UPLOAD = os.getenv("ELN_UPLOAD_DIR", os.path.join(os.getcwd(), "uploads", "eln"))
+# ============================================================
+# CẤU HÌNH CỨNG: LUÔN LƯU MEDIA Ở FILE SERVER NÀY
+# ============================================================
+MEDIA_ROOT = r"\\10.73.131.2\eln_media"
+
+# (Tùy chọn) Nếu muốn cho phép override bằng env, đổi thành:
+# MEDIA_ROOT = os.getenv("ELN_UPLOAD_DIR") or r"\\10.73.131.2\media"
+
+BASE_UPLOAD = MEDIA_ROOT
 VIDEO_DIR = os.path.join(BASE_UPLOAD, "videos")
 COVER_DIR = os.path.join(BASE_UPLOAD, "covers")
+
+# Tạo thư mục trên UNC share (đòi hỏi service account có quyền ghi)
 os.makedirs(VIDEO_DIR, exist_ok=True)
 os.makedirs(COVER_DIR, exist_ok=True)
 
@@ -19,11 +28,12 @@ ALLOWED_IMAGE = {"png", "jpg", "jpeg", "gif", "webp"}
 ALLOWED_VIDEO = {"mp4", "mov", "avi", "mkv", "webm"}
 
 # ========== Giá trị mặc định cho mapping ==========
-DEFAULT_STATUS = "fail"  # giữ nguyên theo code hiện tại
+DEFAULT_STATUS = "fail"
 DEFAULT_TRAINING_TYPE = "Đào tạo lần đầu"
 DEFAULT_HIEN_TRANG = "Chưa đào tạo"
 DEFAULT_GAN_NHAT = "Chưa đào tạo"
-DEFAULT_STATUS_WATCH = "fail"  # thêm mới: chỉ nhận 'fail' hoặc 'pass' (DB có CHECK)
+DEFAULT_STATUS_WATCH = "fail"
+
 
 def _ext_ok(filename, allow_set):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in allow_set
@@ -31,39 +41,52 @@ def _ext_ok(filename, allow_set):
 
 def _save_file(file_storage, folder, allow_set):
     """
-    Lưu file vào thư mục 'folder' với tên UUID, trả về đường dẫn tương đối từ cwd để lưu DB.
+    Lưu file vào UNC share (\\10.73.131.2\media\videos or covers) với tên UUID.
+    DB chỉ lưu path tương đối theo BASE_UPLOAD:
+      - videos/<uuid>.mp4
+      - covers/<uuid>.jpg
     """
     if not file_storage or file_storage.filename == "":
         return None
+
     fname = secure_filename(file_storage.filename)
     if not _ext_ok(fname, allow_set):
         return None
+
     ext = fname.rsplit(".", 1)[1].lower()
     new_name = f"{uuid.uuid4().hex}.{ext}"
-    path = os.path.join(folder, new_name)
-    file_storage.save(path)
-    # Trả về đường dẫn tương đối để lưu DB (dạng: uploads/eln/videos/xxx.mp4)
-    rel = os.path.relpath(path, os.getcwd()).replace("\\", "/")
-    return rel
+
+    abs_path = os.path.join(folder, new_name)
+    file_storage.save(abs_path)
+
+    rel_path = os.path.relpath(abs_path, BASE_UPLOAD).replace("\\", "/")
+    return rel_path
 
 
 def _abs_from_rel(rel_path: str):
     """
-    Convert đường dẫn tương đối (lưu trong DB) -> absolute path trên server.
-    An toàn vì tên file do hệ thống sinh (UUID).
+    Convert DB path -> absolute path trên UNC share.
+    Hỗ trợ:
+      - videos/xxx.mp4
+      - covers/yyy.jpg
+    Nếu DB lỡ lưu absolute path thì trả nguyên.
     """
     if not rel_path:
         return None
+
     rp = rel_path.replace("\\", "/")
-    if os.path.isabs(rp):
+
+    # absolute path (C:\..., /..., UNC: //10.73...)
+    if os.path.isabs(rp) or rp.startswith("//"):
         return rp
-    abs_path = os.path.join(os.getcwd(), rp)
-    return abs_path
+
+    return os.path.join(BASE_UPLOAD, rp.replace("/", os.sep))
 
 
 def _safe_remove_file(rel_path: str) -> bool:
     """
-    Xoá file theo đường dẫn tương đối lưu trong DB. Không raise exception.
+    Xoá file theo đường dẫn lưu trong DB. Không raise exception.
+    Xoá trên UNC share.
     """
     if not rel_path:
         return False
@@ -79,14 +102,21 @@ def _safe_remove_file(rel_path: str) -> bool:
         return False
 
 
-# ========== FILE SERVE (tuỳ chọn) ==========
+# ========== FILE SERVE ==========
+# IMPORTANT:
+# - DB lưu "videos/<file>" nên client phải gọi:
+#   /files/eln/videos/<file>
+# - DB lưu "covers/<file>" nên client gọi:
+#   /files/eln/covers/<file>
 @eln_bp.route("/files/eln/videos/<path:filename>")
 def serve_video(filename):
+    # filename nên là "<uuid>.mp4"
     return send_from_directory(VIDEO_DIR, filename, as_attachment=False)
 
 
 @eln_bp.route("/files/eln/covers/<path:filename>")
 def serve_cover(filename):
+    # filename nên là "<uuid>.jpg"
     return send_from_directory(COVER_DIR, filename, as_attachment=False)
 
 
@@ -100,7 +130,7 @@ def list_eln():
           id,
           title,
           CAST(positions AS CHAR) AS positions,
-          training_time,             -- giữ nguyên, có thể là TEXT
+          training_time,
           note,
           video_path,
           cover_path,
@@ -126,7 +156,7 @@ def get_eln(item_id):
           id,
           title,
           CAST(positions AS CHAR) AS positions,
-          training_time,             -- giữ nguyên, có thể là TEXT
+          training_time,
           note,
           video_path,
           cover_path,
@@ -150,10 +180,9 @@ def get_eln(item_id):
 def update_eln(item_id):
     title = request.form.get("title", "").strip()
     positions = request.form.get("positions")
-    training_time = request.form.get("training_time") or None  # text
+    training_time = request.form.get("training_time") or None
     note = request.form.get("note")
 
-    # lấy bản ghi hiện tại
     conn = get_connection()
     cur = conn.cursor(dictionary=True)
     cur.execute("SELECT * FROM eln WHERE id=%s", (item_id,))
@@ -165,14 +194,14 @@ def update_eln(item_id):
     old_video_path = row.get("video_path")
     old_cover_path = row.get("cover_path")
 
-    # Mặc định dùng lại path cũ
+    # mặc định giữ cũ
     video_path = old_video_path
     cover_path = old_cover_path
 
     uploaded_new_video = False
     uploaded_new_cover = False
 
-    # Nhận & lưu video mới (nếu có)
+    # Nhận & lưu video mới (UNC)
     if "video" in request.files and request.files["video"].filename:
         new_video = _save_file(request.files["video"], VIDEO_DIR, ALLOWED_VIDEO)
         if not new_video:
@@ -181,7 +210,7 @@ def update_eln(item_id):
         video_path = new_video
         uploaded_new_video = True
 
-    # Nhận & lưu cover mới (nếu có)
+    # Nhận & lưu cover mới (UNC)
     if "cover" in request.files and request.files["cover"].filename:
         new_cover = _save_file(request.files["cover"], COVER_DIR, ALLOWED_IMAGE)
         if not new_cover:
@@ -190,18 +219,16 @@ def update_eln(item_id):
         cover_path = new_cover
         uploaded_new_cover = True
 
-    # --- Chuẩn bị giá trị mới để update bảng eln ---
     new_title = title or row["title"]
     new_positions_str = positions if positions is not None else row["positions"]
     new_training_time = training_time if training_time is not None else row["training_time"]
     new_note = note if note is not None else row["note"]
 
-    # Nếu client gửi positions nhưng rỗng sau chuẩn hoá -> từ chối
+    # Nếu client gửi positions nhưng rỗng -> từ chối (và rollback file mới)
     if positions is not None:
         norm_list = [p.strip().lower() for p in positions.split(",") if p.strip()]
         if not norm_list:
             cur.close(); conn.close()
-            # rollback file mới nếu có
             if uploaded_new_video and video_path != old_video_path:
                 _safe_remove_file(video_path)
             if uploaded_new_cover and cover_path != old_cover_path:
@@ -209,8 +236,7 @@ def update_eln(item_id):
             return jsonify({"error": "positions is empty"}), 400
 
     try:
-        # Dùng cùng transaction cho cả update + sync mapping
-        # 1) Update bảng eln (metadata trước)
+        # 1) Update bảng eln
         upd_sql = """
           UPDATE eln
           SET title=%s, positions=%s, training_time=%s, note=%s, video_path=%s, cover_path=%s, updated_at=NOW()
@@ -239,7 +265,6 @@ def update_eln(item_id):
         else:
             target_emps = set()
 
-        # existing_set
         cur4 = conn.cursor(dictionary=True)
         cur4.execute("""
             SELECT employee_id
@@ -252,7 +277,6 @@ def update_eln(item_id):
         to_insert = list(target_emps - existing_emps)
         to_delete = list(existing_emps - target_emps)
 
-        # Xoá những mapping không còn đúng
         if to_delete:
             del_placeholders = ", ".join(["%s"] * len(to_delete))
             del_sql = f"""
@@ -263,7 +287,6 @@ def update_eln(item_id):
             cur5.execute(del_sql, (item_id, *to_delete))
             cur5.close()
 
-            # Giảm tong_so_mon_hoc cho các employee_id bị xoá mapping (không âm)
             curSD = conn.cursor()
             curSD.execute(
                 f"""
@@ -275,9 +298,7 @@ def update_eln(item_id):
             )
             curSD.close()
 
-        # Thêm mapping mới cho nhân viên target chưa có
         if to_insert:
-            # thêm status, training_type, status_watch với giá trị mặc định
             ins_sql = """
                 INSERT INTO nsh.eln_employee_courses
                     (employee_id, course_id, gan_nhat, ngay, ket_qua, hien_trang, thoi_gian_yeu_cau, status, training_type, status_watch)
@@ -285,16 +306,16 @@ def update_eln(item_id):
             """
             values = [
                 (
-                    eid,                 # employee_id
-                    item_id,             # course_id
-                    DEFAULT_GAN_NHAT,    # gan_nhat
-                    None,                # ngay
-                    None,                # ket_qua
-                    DEFAULT_HIEN_TRANG,  # hien_trang
-                    None,                # thoi_gian_yeu_cau
-                    DEFAULT_STATUS,      # status
-                    DEFAULT_TRAINING_TYPE,  # training_type
-                    DEFAULT_STATUS_WATCH    # status_watch (fail)
+                    eid,
+                    item_id,
+                    DEFAULT_GAN_NHAT,
+                    None,
+                    None,
+                    DEFAULT_HIEN_TRANG,
+                    None,
+                    DEFAULT_STATUS,
+                    DEFAULT_TRAINING_TYPE,
+                    DEFAULT_STATUS_WATCH
                 )
                 for eid in to_insert
             ]
@@ -302,7 +323,6 @@ def update_eln(item_id):
             cur6.executemany(ins_sql, values)
             cur6.close()
 
-            # Tăng tong_so_mon_hoc cho employee đã có trạng thái
             ins_placeholders = ", ".join(["%s"] * len(to_insert))
             curSI = conn.cursor()
             curSI.execute(
@@ -315,7 +335,6 @@ def update_eln(item_id):
             )
             curSI.close()
 
-            # Thêm mới dòng trạng thái cho employee chưa có
             curSI2 = conn.cursor(dictionary=True)
             curSI2.execute(
                 f"SELECT employee_id FROM nsh.eln_employee_status WHERE employee_id IN ({ins_placeholders})",
@@ -337,7 +356,7 @@ def update_eln(item_id):
                 )
                 curSI3.close()
 
-        # 2b) TÍNH LẠI tong_nhan_vien_hoc & so_nhan_vien_hoan_thanh CHO MÔN HỌC
+        # 2b) Tính lại counter cho môn học
         cur_cnt = conn.cursor(dictionary=True)
         cur_cnt.execute("""
             SELECT
@@ -358,11 +377,9 @@ def update_eln(item_id):
         """, (cnt["total"] or 0, cnt["passed"] or 0, item_id))
         cur_upd_count.close()
 
-        # 3) Commit
         conn.commit()
 
     except Exception:
-        # Rollback nếu lỗi; xoá file mới vừa upload (nếu có) để không rác
         conn.rollback()
         if uploaded_new_video and video_path != old_video_path:
             _safe_remove_file(video_path)
@@ -372,7 +389,7 @@ def update_eln(item_id):
         app.logger.exception("[ELN] Update failed (with mapping + status sync)")
         return jsonify({"error": "Update failed"}), 500
 
-    # Commit OK -> xoá file cũ nếu có upload mới
+    # Commit OK -> xoá file cũ nếu có upload mới (xoá trên UNC)
     removed_old_video = False
     removed_old_cover = False
     if uploaded_new_video and old_video_path and old_video_path != video_path:
@@ -392,12 +409,11 @@ def update_eln(item_id):
     }), 200
 
 
-# POST /eln -> thêm mới (multipart/form-data)
 @eln_bp.route("/eln", methods=["POST"])
 def create_eln():
     title = request.form.get("title", "").strip()
-    positions = request.form.get("positions", "")              # ví dụ "staff,ld"
-    training_time = request.form.get("training_time") or None  # text theo yêu cầu
+    positions = request.form.get("positions", "")
+    training_time = request.form.get("training_time") or None
     note = request.form.get("note", "")
 
     if not title:
@@ -405,7 +421,6 @@ def create_eln():
     if not positions:
         return jsonify({"error": "positions is required"}), 400
 
-    # Chuẩn hoá positions -> list các vị trí (lowercase, trim)
     pos_list = [p.strip().lower() for p in positions.split(",") if p.strip()]
     if not pos_list:
         return jsonify({"error": "positions is empty"}), 400
@@ -413,7 +428,7 @@ def create_eln():
     video_path = None
     cover_path = None
 
-    # File upload
+    # Upload file lên UNC
     if "video" in request.files:
         video_path = _save_file(request.files["video"], VIDEO_DIR, ALLOWED_VIDEO)
         if request.files["video"].filename and not video_path:
@@ -426,7 +441,6 @@ def create_eln():
 
     conn = get_connection()
     try:
-        # 2) Lấy danh sách nhân viên matching (active + vi_tri ∈ positions)
         placeholders = ", ".join(["%s"] * len(pos_list))
         sel_sql = f"""
             SELECT id AS employee_id
@@ -440,9 +454,8 @@ def create_eln():
         cur2.close()
 
         total_learners = len(employees) if employees else 0
-        total_passed = 0  # khi mới tạo, chưa ai hoàn thành
+        total_passed = 0
 
-        # 1) Tạo khoá học (THÊM 2 CỘT tong_nhan_vien_hoc, so_nhan_vien_hoan_thanh)
         cur = conn.cursor()
         cur.execute("""
             INSERT INTO eln (title, positions, training_time, note, video_path, cover_path,
@@ -456,9 +469,7 @@ def create_eln():
         new_id = cur.lastrowid
         cur.close()
 
-        # 3) Bulk insert vào nsh.eln_employee_courses
         if employees:
-            # thêm status, training_type, status_watch với giá trị mặc định
             ins_sql = """
                 INSERT INTO nsh.eln_employee_courses
                     (employee_id, course_id, gan_nhat, ngay, ket_qua, hien_trang, thoi_gian_yeu_cau, status, training_type, status_watch)
@@ -470,24 +481,22 @@ def create_eln():
                 eid = e["employee_id"]
                 emp_ids.append(eid)
                 values.append((
-                    eid,                 # employee_id
-                    new_id,              # course_id
-                    DEFAULT_GAN_NHAT,    # gan_nhat
-                    None,                # ngay
-                    None,                # ket_qua
-                    DEFAULT_HIEN_TRANG,  # hien_trang
-                    None,                # thoi_gian_yeu_cau
-                    DEFAULT_STATUS,      # status
-                    DEFAULT_TRAINING_TYPE,  # training_type
-                    DEFAULT_STATUS_WATCH    # status_watch (fail)
+                    eid, new_id,
+                    DEFAULT_GAN_NHAT,
+                    None,
+                    None,
+                    DEFAULT_HIEN_TRANG,
+                    None,
+                    DEFAULT_STATUS,
+                    DEFAULT_TRAINING_TYPE,
+                    DEFAULT_STATUS_WATCH
                 ))
             cur3 = conn.cursor()
             cur3.executemany(ins_sql, values)
             cur3.close()
 
-            # 3b) Đồng bộ bảng trạng thái nsh.eln_employee_status
-            # Tăng tong_so_mon_hoc cho những nhân viên đã có dòng trạng thái
             placeholders_emp = ", ".join(["%s"] * len(emp_ids))
+
             curS1 = conn.cursor()
             curS1.execute(
                 f"""
@@ -499,7 +508,6 @@ def create_eln():
             )
             curS1.close()
 
-            # Thêm mới dòng trạng thái cho nhân viên chưa có
             curS2 = conn.cursor(dictionary=True)
             curS2.execute(
                 f"SELECT employee_id FROM nsh.eln_employee_status WHERE employee_id IN ({placeholders_emp})",
@@ -524,7 +532,7 @@ def create_eln():
         conn.commit()
     except Exception:
         conn.rollback()
-        # Nếu lỗi và đã upload file, xoá để tránh rác
+        # rollback file đã upload lên UNC nếu tạo course fail
         if video_path:
             _safe_remove_file(video_path)
         if cover_path:
@@ -537,7 +545,6 @@ def create_eln():
     return jsonify({"id": new_id, "linked_employees": len(employees) if employees else 0}), 201
 
 
-# DELETE /eln/<id> -> xoá
 @eln_bp.route("/eln/<int:item_id>", methods=["DELETE"])
 def delete_eln(item_id):
     conn = get_connection()
@@ -551,18 +558,16 @@ def delete_eln(item_id):
     video_path = row.get("video_path")
     cover_path = row.get("cover_path")
 
-    # Lấy danh sách employee_id đang map với course để trừ điểm status sau khi xoá
     curM = conn.cursor(dictionary=True)
     curM.execute("SELECT employee_id FROM nsh.eln_employee_courses WHERE course_id = %s", (item_id,))
     mapped = [r["employee_id"] for r in curM.fetchall()]
     curM.close()
 
-    # Xoá file trên đĩa (không làm fail nếu lỗi)
+    # Xoá file trên UNC trước (không fail nếu lỗi)
     removed_video = _safe_remove_file(video_path)
     removed_cover = _safe_remove_file(cover_path)
 
     try:
-        # Giảm tong_so_mon_hoc cho toàn bộ nhân viên đã map với course này
         if mapped:
             placeholders_emp = ", ".join(["%s"] * len(mapped))
             curDStat = conn.cursor()
@@ -576,10 +581,8 @@ def delete_eln(item_id):
             )
             curDStat.close()
 
-        # Xoá mapping courses -> employees trước (theo course_id)
         cur2 = conn.cursor()
         cur2.execute("DELETE FROM nsh.eln_employee_courses WHERE course_id = %s", (item_id,))
-        # Xoá khoá học
         cur2.execute("DELETE FROM eln WHERE id=%s", (item_id,))
         conn.commit()
         cur2.close()

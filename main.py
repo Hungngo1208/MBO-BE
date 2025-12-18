@@ -1,7 +1,6 @@
 # main.py
 from flask import Flask, send_from_directory, abort
 from flask_cors import CORS
-from werkzeug.utils import safe_join
 import os
 
 # ==== Import các Blueprint hiện có ====
@@ -23,9 +22,10 @@ from ELearning.eln_employee_list import eln_employee_bp
 from ELearning.eln_request import eln_request_bp
 from ELearning.eln_courses import eln_courses_bp
 from ELearning.quizz import bp as quiz_bp
+
 # ==== Khởi tạo Flask ====
 app = Flask(__name__)
-CORS(app)  # Cho phép FE gọi API từ domain khác (React port 3000)
+CORS(app)
 
 # ==== Đăng ký Blueprints ====
 app.register_blueprint(auth_bp)
@@ -46,24 +46,79 @@ app.register_blueprint(eln_employee_bp)
 app.register_blueprint(eln_request_bp)
 app.register_blueprint(eln_courses_bp)
 app.register_blueprint(quiz_bp)
+
 # ==== Đảm bảo bảng timeline tồn tại ====
 with app.app_context():
     ensure_table()
 
-# ==== Phục vụ file tĩnh trong thư mục "uploads" ====
-UPLOAD_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "uploads"))
+# ============================================================
+# MEDIA ROOT: LUÔN LẤY FILE Ở FILE SERVER (UNC)
+# ============================================================
+MEDIA_ROOT = r"\\10.73.131.2\eln_media"
+# Nếu bạn thật sự có share name "media" thì đổi thành:
+# MEDIA_ROOT = r"\\10.73.131.2\media"
 
-@app.get("/uploads/<path:filename>")
-def serve_uploads(filename):
-    """Trả về ảnh/video từ thư mục uploads"""
-    fullpath = safe_join(UPLOAD_ROOT, filename)
-    if not fullpath or not os.path.isfile(fullpath):
+
+def _normalize_rel_path(p: str) -> str:
+    """
+    Chuẩn hoá path từ request:
+    - bỏ leading '/'
+    - đổi '\' -> '/'
+    - chặn traversal '..'
+    - hỗ trợ legacy: 'uploads/eln/...'
+    """
+    p = (p or "").replace("\\", "/").lstrip("/")
+
+    # Tương thích cũ: DB/FE có thể gửi uploads/eln/videos/xxx.mp4
+    if p.startswith("uploads/eln/"):
+        p = p[len("uploads/eln/"):]
+
+    # Chặn path traversal
+    if ".." in p.split("/"):
+        abort(400)
+
+    return p
+
+
+def _send_from_media(rel_path: str):
+    """
+    Send file từ UNC media root.
+    rel_path ví dụ:
+      - videos/abc.mp4
+      - covers/xyz.png
+    """
+    rel = _normalize_rel_path(rel_path)
+    fullpath = os.path.join(MEDIA_ROOT, rel.replace("/", os.sep))
+
+    if not os.path.isfile(fullpath):
         abort(404)
-    resp = send_from_directory(UPLOAD_ROOT, filename, conditional=True)
+
+    directory = os.path.dirname(fullpath)
+    base = os.path.basename(fullpath)
+
+    resp = send_from_directory(directory, base, conditional=True)
     resp.headers["Access-Control-Allow-Origin"] = "*"
     resp.headers["Accept-Ranges"] = "bytes"
     return resp
 
+
+# ===== Route chuẩn: /uploads/... =====
+@app.get("/uploads/<path:filename>")
+def serve_uploads(filename):
+    return _send_from_media(filename)
+
+
+# ===== Alias cho frontend đang gọi /covers/... và /videos/... =====
+@app.get("/covers/<path:filename>")
+def serve_covers(filename):
+    return _send_from_media(f"covers/{filename}")
+
+
+@app.get("/videos/<path:filename>")
+def serve_videos(filename):
+    return _send_from_media(f"videos/{filename}")
+
+
 # ==== Chạy server ====
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    app.run(debug=True, use_reloader=False, host="0.0.0.0", port=5000)
