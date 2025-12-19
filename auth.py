@@ -188,12 +188,15 @@ def admin_reset_password():
     employee_id = data.get('employee_id')
     new_password = data.get('new_password')
 
-    if not employee_id or not new_password:
-        return jsonify({'error': 'employee_id và new_password là bắt buộc'}), 400
+    # ✅ employee_id bắt buộc, new_password chỉ cần không rỗng
+    if not employee_id:
+        return jsonify({'error': 'employee_id là bắt buộc'}), 400
 
-    # ✅ Giữ quy tắc tương tự endpoint change-password của bạn
-    if len(new_password) < 4:
-        return jsonify({'error': 'Mật khẩu mới phải có ít nhất 4 ký tự'}), 400
+    if new_password is None or str(new_password).strip() == "":
+        return jsonify({'error': 'new_password là bắt buộc'}), 400
+
+    # ✅ Cho phép 1 ký tự trở lên (không check len >= 4 nữa)
+    new_password = str(new_password)
 
     conn = None
     cursor = None
@@ -238,12 +241,11 @@ def admin_reset_password():
 
         return jsonify({
             'message': 'Reset mật khẩu thành công',
-            'username': user['username'],      # tiện cho phía frontend hiển thị
+            'username': user['username'],
             'employee_id': emp['employee_id']
         }), 200
 
     except Exception as e:
-        # Có thể log chi tiết e để audit
         return jsonify({'error': str(e)}), 500
 
     finally:
@@ -251,3 +253,4 @@ def admin_reset_password():
             cursor.close()
         if conn and conn.is_connected():
             conn.close()
+
