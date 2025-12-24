@@ -80,6 +80,30 @@ def submit_mbo():
                 u = get_unit_by_id(u['parent_id'])
             return chain  # chain[0] = leaf
 
+        # ===== [CHỈ THÊM] Rule position hợp lệ cho Reviewer (>= Trưởng phòng) =====
+        REVIEWER_OK_POSITIONS = {
+            "Tổng giám đốc",
+            "Phó tổng giám đốc",
+            "Giám đốc",
+            "Phó giám đốc",
+            "Trường phòng cấp cao",
+            "Phó phòng cấp cao",
+            "Trưởng phòng",
+        }
+
+        def get_employee_position(eid):
+            if not eid:
+                return None
+            with conn.cursor(dictionary=True, buffered=True) as cur:
+                cur.execute("""
+                    SELECT position
+                    FROM nsh.employees2026_base
+                    WHERE id = %s
+                    LIMIT 1
+                """, (eid,))
+                row = cur.fetchone()
+            return row["position"] if row else None
+
         # ===== Tìm reviewer/approver theo rule mới (bỏ LEVEL_ORDER) =====
         reviewer_id = employee_id
         approver_id = employee_id
@@ -88,17 +112,22 @@ def submit_mbo():
         if leaf_unit_id:
             path = climb_chain_from(leaf_unit_id)  # từ đơn vị NV -> đỉnh
 
-            # --- Reviewer:
-            # manager của đơn vị hiện tại nếu khác NV; nếu trùng -> leo lên tới tổ tiên đầu tiên có manager khác NV
+            # --- Reviewer (SỬA THEO YÊU CẦU):
+            # Chỉ chọn manager khác NV và position phải từ Trưởng phòng trở lên.
+            # Nếu manager là Phó phòng / Trưởng nhóm / Phó nhóm / Nhân viên -> bỏ qua và leo lên tới khi gặp Trưởng phòng.
             if path:
-                cur_unit = path[0]
-                if cur_unit.get('employee_id') and cur_unit['employee_id'] != employee_id:
-                    reviewer_unit = cur_unit
-                else:
-                    for u in path[1:]:
-                        if u.get('employee_id') and u['employee_id'] != employee_id:
-                            reviewer_unit = u
-                            break
+                for u in path:  # từ đơn vị hiện tại lên dần
+                    mid = u.get('employee_id')
+                    if not mid:
+                        continue
+                    if mid == employee_id:
+                        continue
+
+                    pos = get_employee_position(mid)
+                    if pos in REVIEWER_OK_POSITIONS:
+                        reviewer_unit = u
+                        break
+
             reviewer_id = reviewer_unit['employee_id'] if reviewer_unit else employee_id
 
             # --- Approver (cấp NGAY TRÊN reviewer):

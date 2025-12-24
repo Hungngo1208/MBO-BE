@@ -159,3 +159,35 @@ def remove_permission():
             cursor.close()
         if conn:
             conn.close()
+# Lấy danh sách employee_id có role_id = 1
+@permission_bp.route('/role-1-employee-ids', methods=['GET'])
+def get_role_1_employee_ids():
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        cursor.execute("""
+            SELECT employee_id
+            FROM employee_roles
+            WHERE role_id = %s
+            ORDER BY employee_id
+        """, (1,))
+
+        rows = cursor.fetchall()
+        employee_ids = [row["employee_id"] for row in rows]
+
+        return jsonify({
+            "role_id": 1,
+            "employee_ids": employee_ids,
+            "count": len(employee_ids)
+        }), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()

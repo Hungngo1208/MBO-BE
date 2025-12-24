@@ -17,12 +17,15 @@ from MBO.submit import submit_bp
 from MBO.timelineMBO import mbo_timeline_bpp, ensure_table
 from MBO.status import status_bp
 from MBO.attitudeMBO import attitude_bp
+from MBO.mbo_notifications import mbo_notifications_bp
+
 from ELearning.eln import eln_bp
 from ELearning.eln_employee_list import eln_employee_bp
 from ELearning.eln_request import eln_request_bp
 from ELearning.eln_courses import eln_courses_bp
 from ELearning.quizz import bp as quiz_bp
-
+from personnel_notifications import personnel_notifications_bp
+from employees_notifications import employees_notifications_bp
 # ==== Khởi tạo Flask ====
 app = Flask(__name__)
 CORS(app)
@@ -46,7 +49,9 @@ app.register_blueprint(eln_employee_bp)
 app.register_blueprint(eln_request_bp)
 app.register_blueprint(eln_courses_bp)
 app.register_blueprint(quiz_bp)
-
+app.register_blueprint(personnel_notifications_bp)
+app.register_blueprint(mbo_notifications_bp)
+app.register_blueprint(employees_notifications_bp)
 # ==== Đảm bảo bảng timeline tồn tại ====
 with app.app_context():
     ensure_table()
