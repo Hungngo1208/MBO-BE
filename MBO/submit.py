@@ -83,7 +83,7 @@ def submit_mbo():
         # ===== [CHỈ THÊM] Rule position hợp lệ cho Reviewer (>= Trưởng phòng) =====
         REVIEWER_OK_POSITIONS = {
             "tổng giám đốc",
-            "thó tổng giám đốc",
+            "phó tổng giám đốc",
             "giám đốc",
             "phó giám đốc",
             "trường phòng cấp cao",
