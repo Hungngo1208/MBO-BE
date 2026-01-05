@@ -82,13 +82,13 @@ def submit_mbo():
 
         # ===== [CHỈ THÊM] Rule position hợp lệ cho Reviewer (>= Trưởng phòng) =====
         REVIEWER_OK_POSITIONS = {
-            "Tổng giám đốc",
-            "Phó tổng giám đốc",
-            "Giám đốc",
-            "Phó giám đốc",
-            "Trường phòng cấp cao",
-            "Phó phòng cấp cao",
-            "Trưởng phòng",
+            "tổng giám đốc",
+            "thó tổng giám đốc",
+            "giám đốc",
+            "phó giám đốc",
+            "trường phòng cấp cao",
+            "phó phòng cấp cao",
+            "trưởng phòng",
         }
 
         def get_employee_position(eid):
@@ -124,10 +124,13 @@ def submit_mbo():
                         continue
 
                     pos = get_employee_position(mid)
-                    if pos in REVIEWER_OK_POSITIONS:
+
+                    # SỬA: normalize để không phân biệt hoa/thường + chống None/space
+                    pos_norm = (pos or "").strip().lower()
+
+                    if pos_norm in REVIEWER_OK_POSITIONS:
                         reviewer_unit = u
                         break
-
             reviewer_id = reviewer_unit['employee_id'] if reviewer_unit else employee_id
 
             # --- Approver (cấp NGAY TRÊN reviewer):
