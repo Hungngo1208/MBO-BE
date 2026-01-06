@@ -101,6 +101,14 @@ def submit_mbo():
             "phó phòng",
         }
 
+        # ✅ NEW: Approver phải là Ban giám đốc trở lên
+        APPROVER_OK_POSITIONS = {
+            "tổng giám đốc",
+            "phó tổng giám đốc",
+            "giám đốc",
+            "phó giám đốc",
+        }
+
         def get_employee_position(eid):
             if not eid:
                 return None
@@ -143,8 +151,9 @@ def submit_mbo():
                         break
             reviewer_id = reviewer_unit["employee_id"] if reviewer_unit else employee_id
 
-            # --- Approver (cấp NGAY TRÊN reviewer):
+            # --- ✅ Approver (BAN GIÁM ĐỐC TRỞ LÊN):
             approver_unit = None
+
             if reviewer_unit:
                 # Tìm vị trí reviewer trong path [leaf,...,root]
                 try:
@@ -154,46 +163,44 @@ def submit_mbo():
                 except StopIteration:
                     idx = -1
 
-                if idx >= 0 and idx + 1 < len(path):
-                    upper = path[idx + 1]
-                    upper_mid = upper.get("employee_id")
+                # Leo lên các cấp phía trên reviewer để tìm manager thuộc BGD
+                if idx >= 0:
+                    for u in path[idx + 1 :]:
+                        mid = u.get("employee_id")
+                        if not mid:
+                            continue
+                        if mid == employee_id:
+                            continue
 
-                    if upper_mid:
-                        if upper_mid == reviewer_id:
-                            approver_unit = upper
-                            approver_id = reviewer_id
-                        elif upper_mid != employee_id:
-                            approver_unit = upper
-                            approver_id = upper_mid
-                        else:
-                            for u in path[idx + 2 :]:
-                                mid = u.get("employee_id")
-                                if mid and mid != employee_id and mid != reviewer_id:
-                                    approver_unit = u
-                                    approver_id = mid
-                                    break
-                            if not approver_unit:
-                                approver_id = reviewer_id
-                    else:
-                        for u in path[idx + 2 :]:
-                            mid = u.get("employee_id")
-                            if mid and mid != employee_id and mid != reviewer_id:
-                                approver_unit = u
-                                approver_id = mid
-                                break
-                        if not approver_unit:
-                            approver_id = reviewer_id
-                else:
-                    approver_id = reviewer_id
-            else:
-                for u in path[1:]:
-                    mid = u.get("employee_id")
-                    if mid and mid != employee_id:
-                        approver_unit = u
-                        approver_id = mid
-                        break
+                        pos = get_employee_position(mid)
+                        pos_norm = (pos or "").strip().lower()
+
+                        if pos_norm in APPROVER_OK_POSITIONS:
+                            approver_unit = u
+                            approver_id = mid
+                            break
+
+                # Fallback: nếu không tìm được BGD -> dùng reviewer để không gãy flow
                 if not approver_unit:
                     approver_id = reviewer_id
+
+            else:
+                # reviewer = self -> vẫn cố tìm approver BGD từ các cấp trên leaf
+                if path:
+                    for u in path[1:]:
+                        mid = u.get("employee_id")
+                        if not mid or mid == employee_id:
+                            continue
+                        pos = get_employee_position(mid)
+                        pos_norm = (pos or "").strip().lower()
+                        if pos_norm in APPROVER_OK_POSITIONS:
+                            approver_unit = u
+                            approver_id = mid
+                            break
+
+                if not approver_unit:
+                    approver_id = reviewer_id
+
         # Nếu không có organization_unit_id: giữ mặc định self/self
 
         # 6) Upsert vào bảng mbo_sessions
@@ -514,12 +521,16 @@ def approve_mbo():
 # FIX LỖI: submit-final KHÔNG dùng (type,name) nữa để tránh trùng
 # -> Tính reviewer/approver theo organization_unit_id (ID + parent_id)
 #    giống /mbo/submit => không còn Unread result found, không chọn nhầm nhánh
+#
+# ✅ UPDATE THEO YÊU CẦU MỚI:
+#    Approver (final) cũng phải thuộc Ban giám đốc trở lên.
 # ============================================================
 def _calc_reviewer_approver_final_by_unit_tree(conn, employee_id: int, leaf_unit_id: int):
     """
     Tính reviewer/approver cho FINAL theo cây organization_units bằng ID (an toàn khi name/type trùng).
     - Reviewer: manager khác NV và position thuộc nhóm >= Trưởng phòng.
-    - Approver: cấp ngay trên reviewer trong path; fallback leo tiếp tìm manager khác.
+    - Approver: BẮT BUỘC thuộc nhóm Ban giám đốc trở lên (GĐ/PGĐ/PGTGĐ/TGĐ),
+               tìm bằng cách leo lên từ reviewer_unit (ưu tiên gần nhất).
     """
     # Rule position hợp lệ cho Reviewer (>= Trưởng phòng)
     REVIEWER_OK_POSITIONS = {
@@ -531,6 +542,14 @@ def _calc_reviewer_approver_final_by_unit_tree(conn, employee_id: int, leaf_unit
         "phó phòng cấp cao",
         "trưởng phòng",
         "phó phòng",
+    }
+
+    # ✅ NEW: Approver phải là Ban giám đốc trở lên
+    APPROVER_OK_POSITIONS = {
+        "tổng giám đốc",
+        "phó tổng giám đốc",
+        "giám đốc",
+        "phó giám đốc",
     }
 
     def get_employee_position(eid):
@@ -596,32 +615,29 @@ def _calc_reviewer_approver_final_by_unit_tree(conn, employee_id: int, leaf_unit
             reviewer_id = mid
             break
 
-    # approver: cấp ngay trên reviewer trong path; fallback leo tiếp
+    # ✅ approver: leo lên từ reviewer_unit để tìm BGD gần nhất
     if reviewer_unit:
         idx = next((i for i, u in enumerate(path) if u["id"] == reviewer_unit["id"]), -1)
-        if idx >= 0 and idx + 1 < len(path):
-            upper = path[idx + 1]
-            upper_mid = upper.get("employee_id")
-            if upper_mid and upper_mid != employee_id:
-                # nếu upper_mid == reviewer_id -> approver = reviewer (KHÔNG leo tiếp)
-                approver_id = reviewer_id if upper_mid == reviewer_id else upper_mid
-            else:
-                # leo tiếp tìm manager khác reviewer & khác NV
-                found = None
-                for uu in path[idx + 2 :]:
-                    mid = uu.get("employee_id")
-                    if mid and mid not in (employee_id, reviewer_id):
-                        found = mid
-                        break
-                approver_id = found if found else reviewer_id
-        else:
-            approver_id = reviewer_id
+        found = None
+        if idx >= 0:
+            for uu in path[idx + 1 :]:
+                mid = uu.get("employee_id")
+                if not mid or mid == employee_id:
+                    continue
+                pos_norm = (get_employee_position(mid) or "").strip().lower()
+                if pos_norm in APPROVER_OK_POSITIONS:
+                    found = mid
+                    break
+        approver_id = found if found else reviewer_id
     else:
-        # reviewer = self -> approver = manager đầu tiên phía trên (nếu có)
+        # reviewer = self -> tìm approver BGD từ các cấp trên leaf
         found = None
         for u in path[1:]:
             mid = u.get("employee_id")
-            if mid and mid != employee_id:
+            if not mid or mid == employee_id:
+                continue
+            pos_norm = (get_employee_position(mid) or "").strip().lower()
+            if pos_norm in APPROVER_OK_POSITIONS:
                 found = mid
                 break
         approver_id = found if found else reviewer_id
@@ -759,7 +775,7 @@ def submit_mbo_final():
         employee_code = emp["employee_code"]
         leaf_unit_id = emp.get("organization_unit_id")
 
-        # 2) Tính reviewer/approver cho giai đoạn cuối năm (FIX: theo organization_unit_id, không theo type+name)
+        # 2) Tính reviewer/approver cho giai đoạn cuối năm (FIX: theo organization_unit_id)
         reviewer_id, approver_id = _calc_reviewer_approver_final_by_unit_tree(
             conn, employee_id, leaf_unit_id
         )

@@ -4,6 +4,64 @@ from database import get_connection
 
 auth_bp = Blueprint('auth', __name__)
 
+
+def _pick_managed_root_unit_id(cursor, managed_unit_ids):
+    """
+    Chọn managed_organization_unit_id theo hướng:
+    - Nếu user quản lý nhiều unit cùng bậc (2+ vị trí), trả về cấp CAO HƠN (tổ tiên chung gần nhất - LCA).
+    - Nếu user chỉ quản lý 1 unit, trả về chính unit đó.
+    - Nếu không có managed_unit_ids, trả về None.
+
+    Lưu ý: chỉ sửa logic chọn managed_organization_unit_id, giữ nguyên các logic khác.
+    """
+    if not managed_unit_ids:
+        return None
+
+    # Lấy map id -> parent_id cho toàn bộ cây để có thể đi ngược lên ancestor
+    cursor.execute("SELECT id, parent_id FROM organization_units")
+    all_units = cursor.fetchall() or []
+    parent_map = {u["id"]: u["parent_id"] for u in all_units}
+
+    def get_ancestor_chain(start_id):
+        """Trả về list tổ tiên từ node lên root: [start, parent, grandparent, ...]"""
+        chain = []
+        cur = start_id
+        seen = set()
+        while cur is not None and cur not in seen:
+            seen.add(cur)
+            chain.append(cur)
+            cur = parent_map.get(cur)
+        return chain
+
+    # Lấy chain tổ tiên cho từng managed unit
+    chains = [get_ancestor_chain(mid) for mid in managed_unit_ids if mid is not None]
+    if not chains:
+        return None
+
+    # Tổ tiên chung (intersection)
+    common = set(chains[0])
+    for ch in chains[1:]:
+        common &= set(ch)
+
+    if not common:
+        # Dữ liệu parent_id có thể bị đứt/không liên thông; fallback ổn định
+        return min(managed_unit_ids)
+
+    # Chọn LCA: node chung có "tổng khoảng cách" nhỏ nhất tới các managed units
+    # (node càng gần các managed units thì index trong chain càng nhỏ)
+    def score(node_id):
+        s = 0
+        for ch in chains:
+            try:
+                s += ch.index(node_id)
+            except ValueError:
+                s += 10**9
+        return s
+
+    # min theo score, nếu hoà thì lấy id nhỏ hơn để ổn định
+    return min(common, key=lambda nid: (score(nid), nid))
+
+
 @auth_bp.route('/api/login', methods=['POST'])
 def login():
     data = request.get_json()
@@ -69,12 +127,8 @@ def login():
         units = cursor.fetchall()
         managed_unit_ids = [u['id'] for u in units]
 
-        # 6. Lọc ra cấp cao nhất (không có cha nằm trong danh sách đang quản lý)
-        top_level_units = [
-            u['id'] for u in units
-            if u['parent_id'] not in managed_unit_ids
-        ]
-        managed_unit_id = top_level_units[0] if top_level_units else None  # chọn 1 cái duy nhất
+        # 6. ✅ SỬA LOGIC: managed_organization_unit_id là cấp CAO HƠN (tổ tiên chung gần nhất)
+        managed_unit_id = _pick_managed_root_unit_id(cursor, managed_unit_ids)
 
         # 7. Tạo token giả (hoặc dùng JWT nếu có)
         token = generate_password_hash(username)[:32]
@@ -103,7 +157,7 @@ def login():
                 'organization_unit_id': employee['organization_unit_id'],
                 'roles': roles,
                 'permissions': permissions,
-                'managed_organization_unit_id': managed_unit_id,              # 👈 duy nhất
+                'managed_organization_unit_id': managed_unit_id,              # 👈 duy nhất (đã sửa: cấp cao hơn)
                 'managed_organization_unit_ids': managed_unit_ids             # 👈 đầy đủ (tuỳ dùng)
             }
         }), 200
@@ -116,6 +170,8 @@ def login():
             cursor.close()
         if conn and conn.is_connected():
             conn.close()
+
+
 @auth_bp.route('/api/change-password', methods=['POST'])
 def change_password():
     """
@@ -175,6 +231,8 @@ def change_password():
             cursor.close()
         if conn and conn.is_connected():
             conn.close()
+
+
 @auth_bp.route('/api/admin/reset-password', methods=['POST'])
 def admin_reset_password():
     """
@@ -253,4 +311,3 @@ def admin_reset_password():
             cursor.close()
         if conn and conn.is_connected():
             conn.close()
-
