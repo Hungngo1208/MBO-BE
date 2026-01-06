@@ -98,6 +98,7 @@ def submit_mbo():
             "trưởng phòng cấp cao",
             "phó phòng cấp cao",
             "trưởng phòng",
+            "phó phòng",
         }
 
         def get_employee_position(eid):
@@ -529,6 +530,7 @@ def _calc_reviewer_approver_final_by_unit_tree(conn, employee_id: int, leaf_unit
         "trưởng phòng cấp cao",
         "phó phòng cấp cao",
         "trưởng phòng",
+        "phó phòng",
     }
 
     def get_employee_position(eid):
