@@ -3,10 +3,16 @@ from flask import Blueprint, request, jsonify
 from database import get_connection
 from flask_jwt_extended import jwt_required, get_jwt_identity
 
-submit_bp = Blueprint('submit', __name__)
+submit_bp = Blueprint("submit", __name__)
 
 LEVEL_ORDER = [
-    'group_name', 'section', 'sub_division', 'division', 'factory', 'company', 'corporation'
+    "group_name",
+    "section",
+    "sub_division",
+    "division",
+    "factory",
+    "company",
+    "corporation",
 ]
 
 # -------------------------------
@@ -34,10 +40,10 @@ def _require_mbo_year_from_request():
 
 
 # -------------------------------
-@submit_bp.route('/mbo/submit', methods=['POST'])
+@submit_bp.route("/mbo/submit", methods=["POST"])
 def submit_mbo():
     data = request.json or {}
-    employee_id = data.get('employee_id')
+    employee_id = data.get("employee_id")
     if not employee_id:
         return jsonify({"error": "employee_id is required"}), 400
 
@@ -54,39 +60,42 @@ def submit_mbo():
         if not emp:
             return jsonify({"error": "employee not found"}), 404
 
-        employee_code = emp['employee_code']
-        leaf_unit_id = emp.get('organization_unit_id')
+        employee_code = emp["employee_code"]
+        leaf_unit_id = emp.get("organization_unit_id")
 
         # ===== Helpers: truy đơn vị và leo lên cha =====
         def get_unit_by_id(uid):
             if not uid:
                 return None
             with conn.cursor(dictionary=True, buffered=True) as cur:
-                cur.execute("""
+                cur.execute(
+                    """
                     SELECT id, name, type, parent_id, employee_id
                     FROM organization_units
                     WHERE id = %s
-                """, (uid,))
+                """,
+                    (uid,),
+                )
                 return cur.fetchone()
 
         def climb_chain_from(start_unit_id, max_depth=64):
             """Trả về list [leaf, ..., root]. Có chống vòng lặp."""
             chain, seen, u = [], set(), get_unit_by_id(start_unit_id)
-            while u and u['id'] not in seen and len(chain) < max_depth:
+            while u and u["id"] not in seen and len(chain) < max_depth:
                 chain.append(u)
-                seen.add(u['id'])
-                if not u.get('parent_id'):
+                seen.add(u["id"])
+                if not u.get("parent_id"):
                     break
-                u = get_unit_by_id(u['parent_id'])
+                u = get_unit_by_id(u["parent_id"])
             return chain  # chain[0] = leaf
 
-        # ===== [CHỈ THÊM] Rule position hợp lệ cho Reviewer (>= Trưởng phòng) =====
+        # ===== Rule position hợp lệ cho Reviewer (>= Trưởng phòng) =====
         REVIEWER_OK_POSITIONS = {
             "tổng giám đốc",
             "phó tổng giám đốc",
             "giám đốc",
             "phó giám đốc",
-            "trường phòng cấp cao",
+            "trưởng phòng cấp cao",
             "phó phòng cấp cao",
             "trưởng phòng",
         }
@@ -95,12 +104,15 @@ def submit_mbo():
             if not eid:
                 return None
             with conn.cursor(dictionary=True, buffered=True) as cur:
-                cur.execute("""
+                cur.execute(
+                    """
                     SELECT position
                     FROM nsh.employees2026_base
                     WHERE id = %s
                     LIMIT 1
-                """, (eid,))
+                """,
+                    (eid,),
+                )
                 row = cur.fetchone()
             return row["position"] if row else None
 
@@ -112,53 +124,49 @@ def submit_mbo():
         if leaf_unit_id:
             path = climb_chain_from(leaf_unit_id)  # từ đơn vị NV -> đỉnh
 
-            # --- Reviewer (SỬA THEO YÊU CẦU):
+            # --- Reviewer:
             # Chỉ chọn manager khác NV và position phải từ Trưởng phòng trở lên.
-            # Nếu manager là Phó phòng / Trưởng nhóm / Phó nhóm / Nhân viên -> bỏ qua và leo lên tới khi gặp Trưởng phòng.
             if path:
                 for u in path:  # từ đơn vị hiện tại lên dần
-                    mid = u.get('employee_id')
+                    mid = u.get("employee_id")
                     if not mid:
                         continue
                     if mid == employee_id:
                         continue
 
                     pos = get_employee_position(mid)
-
-                    # SỬA: normalize để không phân biệt hoa/thường + chống None/space
                     pos_norm = (pos or "").strip().lower()
 
                     if pos_norm in REVIEWER_OK_POSITIONS:
                         reviewer_unit = u
                         break
-            reviewer_id = reviewer_unit['employee_id'] if reviewer_unit else employee_id
+            reviewer_id = reviewer_unit["employee_id"] if reviewer_unit else employee_id
 
             # --- Approver (cấp NGAY TRÊN reviewer):
             approver_unit = None
             if reviewer_unit:
                 # Tìm vị trí reviewer trong path [leaf,...,root]
                 try:
-                    idx = next(i for i, u in enumerate(path) if u['id'] == reviewer_unit['id'])
+                    idx = next(
+                        i for i, u in enumerate(path) if u["id"] == reviewer_unit["id"]
+                    )
                 except StopIteration:
                     idx = -1
 
                 if idx >= 0 and idx + 1 < len(path):
                     upper = path[idx + 1]
-                    upper_mid = upper.get('employee_id')
+                    upper_mid = upper.get("employee_id")
 
                     if upper_mid:
                         if upper_mid == reviewer_id:
-                            # Cấp trên trực tiếp vẫn là reviewer -> approver = reviewer, KHÔNG leo tiếp
-                            approver_unit = upper  # chỉ để tham chiếu nếu cần
+                            approver_unit = upper
                             approver_id = reviewer_id
                         elif upper_mid != employee_id:
-                            # Cấp trên trực tiếp có manager khác reviewer & khác nhân viên -> lấy luôn
                             approver_unit = upper
                             approver_id = upper_mid
                         else:
-                            # Cấp trên trực tiếp do chính nhân viên quản lý (hiếm) -> leo tiếp
-                            for u in path[idx+2:]:
-                                mid = u.get('employee_id')
+                            for u in path[idx + 2 :]:
+                                mid = u.get("employee_id")
                                 if mid and mid != employee_id and mid != reviewer_id:
                                     approver_unit = u
                                     approver_id = mid
@@ -166,9 +174,8 @@ def submit_mbo():
                             if not approver_unit:
                                 approver_id = reviewer_id
                     else:
-                        # Cấp trên trực tiếp không có manager -> leo tiếp tới manager đầu tiên
-                        for u in path[idx+2:]:
-                            mid = u.get('employee_id')
+                        for u in path[idx + 2 :]:
+                            mid = u.get("employee_id")
                             if mid and mid != employee_id and mid != reviewer_id:
                                 approver_unit = u
                                 approver_id = mid
@@ -176,12 +183,10 @@ def submit_mbo():
                         if not approver_unit:
                             approver_id = reviewer_id
                 else:
-                    # reviewer ở đỉnh cây -> approver = reviewer
                     approver_id = reviewer_id
             else:
-                # reviewer là chính NV -> tìm tổ tiên đầu tiên có manager hợp lệ
                 for u in path[1:]:
-                    mid = u.get('employee_id')
+                    mid = u.get("employee_id")
                     if mid and mid != employee_id:
                         approver_unit = u
                         approver_id = mid
@@ -192,14 +197,17 @@ def submit_mbo():
 
         # 6) Upsert vào bảng mbo_sessions
         with conn.cursor() as c:
-            c.execute("""
+            c.execute(
+                """
                 INSERT INTO mbo_sessions (employee_id, mbo_year, status, reviewer_id, approver_id)
                 VALUES (%s, %s, 'submitted', %s, %s)
                 ON DUPLICATE KEY UPDATE
                     status = 'submitted',
                     reviewer_id = VALUES(reviewer_id),
                     approver_id = VALUES(approver_id)
-            """, (employee_id, mbo_year, reviewer_id, approver_id))
+            """,
+                (employee_id, mbo_year, reviewer_id, approver_id),
+            )
         conn.commit()
 
         auto_status = "submitted"
@@ -207,55 +215,80 @@ def submit_mbo():
         # 7) Helpers — tất cả SELECT dùng buffered
         def auto_update_muctieu():
             with conn.cursor(dictionary=True, buffered=True) as cur:
-                cur.execute("""
+                cur.execute(
+                    """
                     SELECT id, ti_trong, xep_loai
                     FROM PersonalMBO
                     WHERE employee_code = %s AND mbo_year = %s
-                """, (employee_code, mbo_year))
+                """,
+                    (employee_code, mbo_year),
+                )
                 goals = cur.fetchall()
             for g in goals:
                 with conn.cursor() as cu:
-                    cu.execute("""
+                    cu.execute(
+                        """
                         UPDATE PersonalMBO SET
                             reviewer_ti_trong = %s,
                             reviewer_rating   = %s,
                             approver_ti_trong = %s,
                             approver_rating   = %s
                         WHERE id = %s AND mbo_year = %s
-                    """, (g['ti_trong'], g['xep_loai'], g['ti_trong'], g['xep_loai'], g['id'], mbo_year))
+                    """,
+                        (
+                            g["ti_trong"],
+                            g["xep_loai"],
+                            g["ti_trong"],
+                            g["xep_loai"],
+                            g["id"],
+                            mbo_year,
+                        ),
+                    )
 
         def auto_update_competency():
             with conn.cursor(dictionary=True, buffered=True) as cur:
-                cur.execute("""
+                cur.execute(
+                    """
                     SELECT id, ti_trong
                     FROM competencymbo
                     WHERE employee_code = %s AND mbo_year = %s
-                """, (employee_code, mbo_year))
+                """,
+                    (employee_code, mbo_year),
+                )
                 goals = cur.fetchall()
             for g in goals:
                 with conn.cursor() as cu:
-                    cu.execute("""
+                    cu.execute(
+                        """
                         UPDATE competencymbo SET
                             reviewer_ti_trong = %s,
                             approver_ti_trong = %s
                         WHERE id = %s AND mbo_year = %s
-                    """, (g['ti_trong'], g['ti_trong'], g['id'], mbo_year))
+                    """,
+                        (g["ti_trong"], g["ti_trong"], g["id"], mbo_year),
+                    )
 
         def approve_now():
             with conn.cursor() as c:
-                c.execute("""
+                c.execute(
+                    """
                     UPDATE mbo_sessions
                     SET status = 'approved'
                     WHERE employee_id = %s AND mbo_year = %s
-                """, (employee_id, mbo_year))
+                """,
+                    (employee_id, mbo_year),
+                )
 
         def review_now():
             with conn.cursor() as c:
-                c.execute("""
+                c.execute(
+                    """
                     UPDATE mbo_sessions
                     SET status = 'reviewed'
                     WHERE employee_id = %s AND mbo_year = %s
-                """, (employee_id, mbo_year))
+                """,
+                    (employee_id, mbo_year),
+                )
 
         # Case 1
         if reviewer_id == approver_id == employee_id:
@@ -269,46 +302,60 @@ def submit_mbo():
         elif reviewer_id == approver_id and reviewer_id != employee_id:
             # copy reviewer -> approver cho từng mục tiêu
             with conn.cursor(dictionary=True, buffered=True) as cur:
-                cur.execute("""
+                cur.execute(
+                    """
                     SELECT id FROM PersonalMBO
                     WHERE employee_code = %s AND mbo_year = %s
-                """, (employee_code, mbo_year))
+                """,
+                    (employee_code, mbo_year),
+                )
                 pgoals = cur.fetchall()
             for g in pgoals:
                 with conn.cursor() as cu:
-                    cu.execute("""
+                    cu.execute(
+                        """
                         UPDATE PersonalMBO SET
                             approver_ti_trong = reviewer_ti_trong,
                             approver_rating   = reviewer_rating
                         WHERE id = %s AND mbo_year = %s
-                    """, (g['id'], mbo_year))
+                    """,
+                        (g["id"], mbo_year),
+                    )
 
             with conn.cursor(dictionary=True, buffered=True) as cur:
-                cur.execute("""
+                cur.execute(
+                    """
                     SELECT id FROM competencymbo
                     WHERE employee_code = %s AND mbo_year = %s
-                """, (employee_code, mbo_year))
+                """,
+                    (employee_code, mbo_year),
+                )
                 cgoals = cur.fetchall()
             for g in cgoals:
                 with conn.cursor() as cu:
-                    cu.execute("""
+                    cu.execute(
+                        """
                         UPDATE competencymbo SET
                             approver_ti_trong = reviewer_ti_trong
                         WHERE id = %s AND mbo_year = %s
-                    """, (g['id'], mbo_year))
+                    """,
+                        (g["id"], mbo_year),
+                    )
 
             review_now()
             auto_status = "reviewed"
 
         conn.commit()
 
-        return jsonify({
-            "success": True,
-            "reviewer_id": reviewer_id,
-            "approver_id": approver_id,
-            "status": auto_status,
-            "mbo_year": mbo_year
-        })
+        return jsonify(
+            {
+                "success": True,
+                "reviewer_id": reviewer_id,
+                "approver_id": approver_id,
+                "status": auto_status,
+                "mbo_year": mbo_year,
+            }
+        )
 
     except Exception as e:
         conn.rollback()
@@ -321,7 +368,7 @@ def submit_mbo():
 # -------------------------------
 # GET SESSION STATUS
 # -------------------------------
-@submit_bp.route('/mbo/session-status/<int:employee_id>', methods=['GET'])
+@submit_bp.route("/mbo/session-status/<int:employee_id>", methods=["GET"])
 def get_mbo_status(employee_id):
     mbo_year = _require_mbo_year_from_request()
     if mbo_year is None:
@@ -329,16 +376,19 @@ def get_mbo_status(employee_id):
 
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
-    cursor.execute("""
+    cursor.execute(
+        """
         SELECT status FROM mbo_sessions
         WHERE employee_id = %s AND mbo_year = %s
-    """, (employee_id, mbo_year))
+    """,
+        (employee_id, mbo_year),
+    )
     row = cursor.fetchone()
     cursor.close()
     conn.close()
 
     if row:
-        return jsonify({"status": row['status'], "mbo_year": mbo_year})
+        return jsonify({"status": row["status"], "mbo_year": mbo_year})
     else:
         return jsonify({"status": "draft", "mbo_year": mbo_year})
 
@@ -346,7 +396,7 @@ def get_mbo_status(employee_id):
 # -------------------------------
 # CHECK PERMISSIONS
 # -------------------------------
-@submit_bp.route('/mbo/permissions/<int:employee_id>', methods=['GET'])
+@submit_bp.route("/mbo/permissions/<int:employee_id>", methods=["GET"])
 @jwt_required()
 def check_mbo_permissions(employee_id):
     current_user_id = get_jwt_identity()
@@ -356,37 +406,32 @@ def check_mbo_permissions(employee_id):
 
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
-    cursor.execute("""
+    cursor.execute(
+        """
         SELECT reviewer_id, approver_id, status
         FROM mbo_sessions
         WHERE employee_id = %s AND mbo_year = %s
-    """, (employee_id, mbo_year))
+    """,
+        (employee_id, mbo_year),
+    )
     row = cursor.fetchone()
     cursor.close()
     conn.close()
 
     if not row:
-        return jsonify({
-            "canReview": False,
-            "canApprove": False,
-            "mbo_year": mbo_year
-        })
+        return jsonify({"canReview": False, "canApprove": False, "mbo_year": mbo_year})
 
-    status = row['status']
-    can_review = (row['reviewer_id'] == current_user_id) and status == 'submitted'
-    can_approve = (row['approver_id'] == current_user_id) and status == 'reviewed'
+    status = row["status"]
+    can_review = (row["reviewer_id"] == current_user_id) and status == "submitted"
+    can_approve = (row["approver_id"] == current_user_id) and status == "reviewed"
 
-    return jsonify({
-        "canReview": can_review,
-        "canApprove": can_approve,
-        "mbo_year": mbo_year
-    })
+    return jsonify({"canReview": can_review, "canApprove": can_approve, "mbo_year": mbo_year})
 
 
 # -------------------------------
 # REVIEW
 # -------------------------------
-@submit_bp.route('/mbo/review', methods=['POST'])
+@submit_bp.route("/mbo/review", methods=["POST"])
 def review_mbo():
     data = request.json or {}
     employee_id = data.get("employee_id")
@@ -405,11 +450,12 @@ def review_mbo():
                 SET status = %s
                 WHERE employee_id = %s AND mbo_year = %s
             """
-            cursor.execute(sql, ('reviewed', employee_id, mbo_year))
+            cursor.execute(sql, ("reviewed", employee_id, mbo_year))
+            rowcount = cursor.rowcount  # tránh phụ thuộc cursor sau when-exit
 
         conn.commit()
 
-        if cursor.rowcount == 0:
+        if rowcount == 0:
             return jsonify({"error": "Không tìm thấy session để cập nhật"}), 404
 
         return jsonify({"message": "Cập nhật trạng thái reviewed thành công.", "mbo_year": mbo_year}), 200
@@ -420,11 +466,11 @@ def review_mbo():
     finally:
         try:
             conn.close()
-        except:
+        except Exception:
             pass
 
 
-@submit_bp.route('/mbo/approve', methods=['POST'])
+@submit_bp.route("/mbo/approve", methods=["POST"])
 def approve_mbo():
     data = request.json or {}
     employee_id = data.get("employee_id")
@@ -443,11 +489,12 @@ def approve_mbo():
                 SET status = %s
                 WHERE employee_id = %s AND mbo_year = %s
             """
-            cursor.execute(sql, ('approved', employee_id, mbo_year))
+            cursor.execute(sql, ("approved", employee_id, mbo_year))
+            rowcount = cursor.rowcount
 
         conn.commit()
 
-        if cursor.rowcount == 0:
+        if rowcount == 0:
             return jsonify({"error": "Không tìm thấy session để cập nhật"}), 404
 
         return jsonify({"message": "Cập nhật trạng thái approved thành công.", "mbo_year": mbo_year}), 200
@@ -458,74 +505,125 @@ def approve_mbo():
     finally:
         try:
             conn.close()
-        except:
+        except Exception:
             pass
 
 
-# -------------------------------
-# Helper: tính reviewer/approver theo cây tổ chức
-# -------------------------------
-def _calc_reviewer_approver(conn, emp_row):
-    cursor = conn.cursor(dictionary=True)
+# ============================================================
+# FIX LỖI: submit-final KHÔNG dùng (type,name) nữa để tránh trùng
+# -> Tính reviewer/approver theo organization_unit_id (ID + parent_id)
+#    giống /mbo/submit => không còn Unread result found, không chọn nhầm nhánh
+# ============================================================
+def _calc_reviewer_approver_final_by_unit_tree(conn, employee_id: int, leaf_unit_id: int):
+    """
+    Tính reviewer/approver cho FINAL theo cây organization_units bằng ID (an toàn khi name/type trùng).
+    - Reviewer: manager khác NV và position thuộc nhóm >= Trưởng phòng.
+    - Approver: cấp ngay trên reviewer trong path; fallback leo tiếp tìm manager khác.
+    """
+    # Rule position hợp lệ cho Reviewer (>= Trưởng phòng)
+    REVIEWER_OK_POSITIONS = {
+        "tổng giám đốc",
+        "phó tổng giám đốc",
+        "giám đốc",
+        "phó giám đốc",
+        "trưởng phòng cấp cao",
+        "phó phòng cấp cao",
+        "trưởng phòng",
+    }
 
-    employee_id = emp_row['id']
+    def get_employee_position(eid):
+        if not eid:
+            return None
+        with conn.cursor(dictionary=True, buffered=True) as cur:
+            cur.execute(
+                """
+                SELECT position
+                FROM nsh.employees2026_base
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (eid,),
+            )
+            row = cur.fetchone()
+        return row["position"] if row else None
 
-    # 1) Xác định cấp cao nhất có giá trị
-    highest_level = None
-    for level in reversed(LEVEL_ORDER):
-        if emp_row.get(level):
-            highest_level = level
-            break
+    def get_unit_by_id(uid):
+        if not uid:
+            return None
+        with conn.cursor(dictionary=True, buffered=True) as cur:
+            cur.execute(
+                """
+                SELECT id, name, type, parent_id, employee_id
+                FROM organization_units
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (uid,),
+            )
+            return cur.fetchone()
 
-    # 2) Nếu chính nhân sự là quản lý cấp cao nhất -> tự reviewer/approver
-    cursor.execute("""
-        SELECT * FROM organization_units
-        WHERE type = %s AND name = %s AND employee_id = %s
-    """, (highest_level, emp_row[highest_level] if highest_level else None, employee_id))
-    is_top_manager = cursor.fetchone()
+    def climb_chain_from(start_unit_id, max_depth=64):
+        chain, seen = [], set()
+        u = get_unit_by_id(start_unit_id)
+        while u and u["id"] not in seen and len(chain) < max_depth:
+            chain.append(u)  # leaf -> root
+            seen.add(u["id"])
+            pid = u.get("parent_id")
+            if not pid:
+                break
+            u = get_unit_by_id(pid)
+        return chain
 
-    if is_top_manager:
-        cursor.close()
-        return employee_id, employee_id
-
-    # 3) Tìm reviewer (cấp cao hơn gần nhất, khác chính mình)
+    reviewer_id = employee_id
+    approver_id = employee_id
     reviewer_unit = None
-    for level in LEVEL_ORDER[1:]:
-        unit_name = emp_row.get(level)
-        if not unit_name:
+
+    if not leaf_unit_id:
+        return reviewer_id, approver_id
+
+    path = climb_chain_from(leaf_unit_id)
+
+    # reviewer: manager khác NV và position hợp lệ
+    for u in path:
+        mid = u.get("employee_id")
+        if not mid or mid == employee_id:
             continue
-        cursor.execute(
-            "SELECT * FROM organization_units WHERE type = %s AND name = %s",
-            (level, unit_name)
-        )
-        unit = cursor.fetchone()
-        if unit and unit.get('employee_id') and unit['employee_id'] != employee_id:
-            reviewer_unit = unit
+        pos_norm = (get_employee_position(mid) or "").strip().lower()
+        if pos_norm in REVIEWER_OK_POSITIONS:
+            reviewer_unit = u
+            reviewer_id = mid
             break
 
-    reviewer_id = reviewer_unit['employee_id'] if reviewer_unit else employee_id
+    # approver: cấp ngay trên reviewer trong path; fallback leo tiếp
+    if reviewer_unit:
+        idx = next((i for i, u in enumerate(path) if u["id"] == reviewer_unit["id"]), -1)
+        if idx >= 0 and idx + 1 < len(path):
+            upper = path[idx + 1]
+            upper_mid = upper.get("employee_id")
+            if upper_mid and upper_mid != employee_id:
+                # nếu upper_mid == reviewer_id -> approver = reviewer (KHÔNG leo tiếp)
+                approver_id = reviewer_id if upper_mid == reviewer_id else upper_mid
+            else:
+                # leo tiếp tìm manager khác reviewer & khác NV
+                found = None
+                for uu in path[idx + 2 :]:
+                    mid = uu.get("employee_id")
+                    if mid and mid not in (employee_id, reviewer_id):
+                        found = mid
+                        break
+                approver_id = found if found else reviewer_id
+        else:
+            approver_id = reviewer_id
+    else:
+        # reviewer = self -> approver = manager đầu tiên phía trên (nếu có)
+        found = None
+        for u in path[1:]:
+            mid = u.get("employee_id")
+            if mid and mid != employee_id:
+                found = mid
+                break
+        approver_id = found if found else reviewer_id
 
-    # 4) Tìm approver (cấp cao hơn reviewer)
-    approver_id = None
-    reviewer_level_index = LEVEL_ORDER.index(reviewer_unit['type']) if reviewer_unit else -1
-    for i in range(reviewer_level_index + 1, len(LEVEL_ORDER)):
-        upper_level = LEVEL_ORDER[i]
-        upper_name = emp_row.get(upper_level)
-        if not upper_name:
-            continue
-        cursor.execute(
-            "SELECT * FROM organization_units WHERE type = %s AND name = %s",
-            (upper_level, upper_name)
-        )
-        unit = cursor.fetchone()
-        if unit and unit.get('employee_id') and unit['employee_id'] != employee_id:
-            approver_id = unit['employee_id']
-            break
-
-    if not approver_id:
-        approver_id = reviewer_id
-
-    cursor.close()
     return reviewer_id, approver_id
 
 
@@ -545,8 +643,10 @@ def _update_mbo_status_final(conn, employee_id: int, mbo_year: int, new_status: 
             (new_status, employee_id, mbo_year),
         )
 
+
 def _review_final_now(conn, employee_id: int, mbo_year: int):
     _update_mbo_status_final(conn, employee_id, mbo_year, "reviewed_final")
+
 
 def _approve_final_now(conn, employee_id: int, mbo_year: int):
     _update_mbo_status_final(conn, employee_id, mbo_year, "approved_final")
@@ -555,7 +655,6 @@ def _approve_final_now(conn, employee_id: int, mbo_year: int):
 # ===========================
 #   CÁC HELPER ĐÃ SỬA AN TOÀN
 # ===========================
-
 def _auto_update_personal_mbo_copy_self_to_review_and_approve(conn, employee_code: str, mbo_year: int):
     """
     Case 1: người lập = reviewer = approver
@@ -576,6 +675,7 @@ def _auto_update_personal_mbo_copy_self_to_review_and_approve(conn, employee_cod
             (employee_code, mbo_year),
         )
 
+
 def _auto_update_competency_copy_self_to_review_and_approve(conn, employee_code: str, mbo_year: int):
     """
     Case 1: người lập = reviewer = approver
@@ -593,6 +693,7 @@ def _auto_update_competency_copy_self_to_review_and_approve(conn, employee_code:
             """,
             (employee_code, mbo_year),
         )
+
 
 def _auto_copy_reviewer_to_approver(conn, employee_code: str, mbo_year: int):
     """
@@ -624,7 +725,7 @@ def _auto_copy_reviewer_to_approver(conn, employee_code: str, mbo_year: int):
         )
 
 
-@submit_bp.route('/mbo/submit-final', methods=['POST'])
+@submit_bp.route("/mbo/submit-final", methods=["POST"])
 def submit_mbo_final():
     """
     Gửi tự đánh giá cuối năm:
@@ -634,7 +735,7 @@ def submit_mbo_final():
     Body JSON: { "employee_id": 123, "mbo_year": 2025 } hoặc ?mbo_year=2025
     """
     data = request.json or {}
-    employee_id = data.get('employee_id')
+    employee_id = data.get("employee_id")
     if not employee_id:
         return jsonify({"error": "employee_id is required"}), 400
 
@@ -643,7 +744,8 @@ def submit_mbo_final():
         return jsonify({"error": "Thiếu hoặc sai định dạng mbo_year (2000..2100)"}), 400
 
     conn = get_connection()
-    cursor = conn.cursor(dictionary=True)
+    # ✅ buffered=True để tránh Unread result found trong mọi trường hợp
+    cursor = conn.cursor(dictionary=True, buffered=True)
 
     try:
         # 1) Lấy thông tin nhân viên
@@ -653,9 +755,12 @@ def submit_mbo_final():
             return jsonify({"error": "employee not found"}), 404
 
         employee_code = emp["employee_code"]
+        leaf_unit_id = emp.get("organization_unit_id")
 
-        # 2) Tính reviewer/approver cho giai đoạn cuối năm
-        reviewer_id, approver_id = _calc_reviewer_approver(conn, emp)
+        # 2) Tính reviewer/approver cho giai đoạn cuối năm (FIX: theo organization_unit_id, không theo type+name)
+        reviewer_id, approver_id = _calc_reviewer_approver_final_by_unit_tree(
+            conn, employee_id, leaf_unit_id
+        )
 
         # 3) Upsert session về submitted_final + set reviewer/approver
         with conn.cursor() as c:
@@ -692,13 +797,18 @@ def submit_mbo_final():
 
         conn.commit()
 
-        return jsonify({
-            "success": True,
-            "reviewer_id": reviewer_id,
-            "approver_id": approver_id,
-            "status": auto_status,
-            "mbo_year": mbo_year
-        }), 200
+        return (
+            jsonify(
+                {
+                    "success": True,
+                    "reviewer_id": reviewer_id,
+                    "approver_id": approver_id,
+                    "status": auto_status,
+                    "mbo_year": mbo_year,
+                }
+            ),
+            200,
+        )
 
     except Exception as e:
         conn.rollback()
@@ -709,7 +819,7 @@ def submit_mbo_final():
         conn.close()
 
 
-@submit_bp.route('/mbo/reviewed_final', methods=['POST'])
+@submit_bp.route("/mbo/reviewed_final", methods=["POST"])
 def reviewed_final_mbo():
     data = request.json or {}
     employee_id = data.get("employee_id")
@@ -731,11 +841,11 @@ def reviewed_final_mbo():
     finally:
         try:
             conn.close()
-        except:
+        except Exception:
             pass
 
 
-@submit_bp.route('/mbo/approved_final', methods=['POST'])
+@submit_bp.route("/mbo/approved_final", methods=["POST"])
 def approved_final_mbo():
     data = request.json or {}
     employee_id = data.get("employee_id")
@@ -757,7 +867,7 @@ def approved_final_mbo():
     finally:
         try:
             conn.close()
-        except:
+        except Exception:
             pass
 
 
@@ -772,9 +882,11 @@ def _update_mbo_status(employee_id: int, mbo_year: int, new_status: str):
                 WHERE employee_id = %s AND mbo_year = %s
             """
             cursor.execute(sql, (new_status, employee_id, mbo_year))
+            rowcount = cursor.rowcount
+
         conn.commit()
 
-        if cursor.rowcount == 0:
+        if rowcount == 0:
             return {"error": "Không tìm thấy session để cập nhật"}, 404
 
         return {"message": f"Cập nhật trạng thái {new_status} thành công.", "mbo_year": mbo_year}, 200
@@ -785,5 +897,5 @@ def _update_mbo_status(employee_id: int, mbo_year: int, new_status: str):
     finally:
         try:
             conn.close()
-        except:
+        except Exception:
             pass
