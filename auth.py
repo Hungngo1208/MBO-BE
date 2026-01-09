@@ -311,3 +311,78 @@ def admin_reset_password():
             cursor.close()
         if conn and conn.is_connected():
             conn.close()
+@auth_bp.route('/api/admin/create-user', methods=['POST'])
+def admin_create_user():
+    """
+    Tạo tài khoản đăng nhập trong bảng users.
+    - username: bắt buộc (thường = employee_code)
+    - password mặc định: "1"
+    - hash dùng method='scrypt' giống change/reset password
+
+    Body JSON expected:
+    {
+      "username": "00001"
+    }
+    """
+    data = request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip()
+
+    if not username:
+        return jsonify({"error": "username là bắt buộc"}), 400
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+
+        # (Khuyến nghị) Check employee_code có tồn tại trong employees2026
+        cursor.execute("""
+            SELECT id
+            FROM employees2026
+            WHERE employee_code = %s
+            LIMIT 1
+        """, (username,))
+        emp = cursor.fetchone()
+        if not emp:
+            return jsonify({"error": "Không tìm thấy nhân viên với employee_code tương ứng"}), 404
+
+        # Check username đã tồn tại trong users chưa
+        cursor.execute("""
+            SELECT id
+            FROM users
+            WHERE username = %s
+            LIMIT 1
+        """, (username,))
+        existed = cursor.fetchone()
+        if existed:
+            return jsonify({"error": "Tài khoản đã tồn tại", "username": username}), 409
+
+        # Mật khẩu mặc định = "1"
+        default_password = "1"
+        password_hash = generate_password_hash(default_password, method="scrypt")
+
+        # Tạo user (tuỳ schema users của bạn có cột gì thêm thì bổ sung)
+        cursor.execute("""
+            INSERT INTO users (username, password_hash)
+            VALUES (%s, %s)
+        """, (username, password_hash))
+        conn.commit()
+
+        return jsonify({
+            "message": "Tạo tài khoản thành công",
+            "username": username,
+            "default_password": "1"
+        }), 201
+
+    except Exception as e:
+        if conn:
+            try: conn.rollback()
+            except: pass
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        if cursor:
+            cursor.close()
+        if conn and conn.is_connected():
+            conn.close()
